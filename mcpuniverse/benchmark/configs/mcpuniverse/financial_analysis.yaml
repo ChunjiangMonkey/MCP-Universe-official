@@ -1,19 +1,19 @@
 kind: llm
 spec:
   name: llm-1
-  type: openai
+  type: openrouter
   config:
-    model_name: gpt-4.1
+    model_name: Kimik2_5_OR
 
 ---
 kind: agent
 spec:
-  name: FunctionCall-agent
-  type: function_call
+  name: function-call-agent
+  type: function-call
   config:
     llm: llm-1
     instruction: You are an agent for financial analysis. If you need to calculate the result, you can use the calculator tool.
-    max_iterations: 20
+    max_iterations: 50
     summarize_tool_response: false
     servers:
       - name: yfinance
@@ -23,7 +23,7 @@ spec:
 kind: benchmark
 spec:
   description: Test agent for yfinance tasks.
-  agent: FunctionCall-agent
+  agent: function-call-agent
   tasks:
     - mcpuniverse/financial_analysis/yfinance_task_0001.json
     - mcpuniverse/financial_analysis/yfinance_task_0002.json

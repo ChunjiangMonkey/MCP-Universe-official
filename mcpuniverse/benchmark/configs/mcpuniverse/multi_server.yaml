@@ -1,26 +1,26 @@
 kind: llm
 spec:
   name: llm-1
-  type: openai
+  type: openrouter
   config:
-    model_name: gpt-4.1
+    model_name: Kimik2_5_OR
 
 ---
 kind: agent
 spec:
-  name: ReAct-agent
-  type: react
+  name: function-call-agent
+  type: function-call
   config:
     llm: llm-1
     instruction: You are an agent for multi-server tasks.
-    max_iterations: 15
-    summarize_tool_response: true
+    max_iterations: 50
+    summarize_tool_response: false
 
 ---
 kind: benchmark
 spec:
   description: Test agent for multi-server tasks. 
-  agent: ReAct-agent
+  agent: function-call-agent
   tasks:
     - mcpuniverse/multi_server/multi-server_task_weather_google_map_0001.json
     # - mcpuniverse/multi_server/multi-server_task_weather_google_map_0002.json
