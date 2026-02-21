@@ -7,6 +7,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from mcpuniverse.evaluator.functions import compare_func
 from mcpuniverse.common.context import Context
+import os
 
 load_dotenv()
 
@@ -44,21 +45,37 @@ correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] giv
 
 def google_search__call_gpt(
         prompt: str,
-        model: str = "gpt-4.1",
+        model: str = os.getenv("EVAL_MODEL_NAME", "qwen3-8b"),
         temperature: float = 0.0,
         **kwargs
 ) -> str:
     """
     Call GPT to get a response to a prompt.
+
+    Environment variables:
+        EVAL_MODEL_BASE_URL: Base URL for the eval model API (optional)
+        EVAL_MODEL_API_KEY: API key for the eval model (falls back to OPENAI_API_KEY)
+        EVAL_MODEL_NAME: Model name (default: qwen3-8b)
     """
     context: Context = kwargs.get("context", Context())
-    client = OpenAI(api_key=context.get_env("OPENAI_API_KEY"))
+
+    # Get eval model configuration from environment variables
+    eval_base_url = os.getenv("EVAL_MODEL_BASE_URL")
+    eval_api_key = os.getenv("EVAL_MODEL_API_KEY") or context.get_env("OPENAI_API_KEY")
+    eval_model_name = os.getenv("EVAL_MODEL_NAME", model)
+
+    # Create client with optional base_url
+    if eval_base_url:
+        client = OpenAI(api_key=eval_api_key, base_url=eval_base_url)
+    else:
+        client = OpenAI(api_key=eval_api_key)
+
     response = None
     attempt = 5
     while attempt > 0:
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=eval_model_name,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt}

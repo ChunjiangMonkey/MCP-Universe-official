@@ -7,12 +7,12 @@ import json
 import math
 from typing import List, Dict, Any
 
-import httpx
+import asyncio
 import click
 from mcp.server.fastmcp import FastMCP
 from mcpuniverse.common.logger import get_logger
 
-SERP_API_BASE = "https://serpapi.com/search.json"
+SERP_API_BASE = "https://google.serper.dev/search"
 API_KEY = os.environ.get("SERP_API_KEY", "")
 
 
@@ -24,7 +24,7 @@ async def _search(
         timeout: float = 30
 ) -> List[Dict[str, Any]]:
     """
-    Make a request to the Serp API.
+    Make a request to the Serp API using curl.
 
     :param query: The search query string.
     :param location: The location for the search query.
@@ -33,29 +33,35 @@ async def _search(
     :param timeout: The timeout.
     """
     all_items = []
-    num_pages = int(math.ceil(num_items / 10))
-    num_items_per_page = 10
 
-    for page in range(num_pages):
-        offset = page * num_items_per_page
-        params = {
-            "api_key": API_KEY,
-            "q": query,
-            "location": location,
-            "engine": engine,
-            "num": num_items_per_page,
-            "start": offset
-        }
-        async with httpx.AsyncClient() as client:
-            response = await client.get(SERP_API_BASE, params=params, timeout=timeout)
-            response.raise_for_status()
-            results = response.json()
-            all_items.extend([{
-                "position": result.get("position") + offset,
-                "title": result.get("title"),
-                "snippet": result.get("snippet"),
-                "link": result.get("link"),
-            } for result in results.get("organic_results", [])])
+    payload = {"q": query, "num": num_items}
+    if location:
+        payload["location"] = location
+
+    proc = await asyncio.create_subprocess_exec(
+        "curl", "-s", "-v", "-X", "POST", SERP_API_BASE,
+        "-H", f"X-API-KEY: {API_KEY}",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(payload),
+        "--max-time", str(int(timeout)),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl failed (code {proc.returncode}): stdout={stdout.decode()}, stderr={stderr.decode()}")
+
+
+    results = json.loads(stdout.decode())
+    # Serper.dev uses "organic" instead of "organic_results"
+    for idx, item in enumerate(results.get("organic", [])):
+        all_items.append({
+            "position": idx + 1,
+            "title": item.get("title"),
+            "snippet": item.get("snippet"),
+            "link": item.get("link"),
+        })
     return all_items[:num_items]
 
 
@@ -80,7 +86,8 @@ def build_server(port: int) -> FastMCP:
             items = await _search(query=query)
             return "\n".join([json.dumps(item, ensure_ascii=False, indent=2) for item in items])
         except Exception as e:
-            return json.dumps({"error": f"Search failed: {str(e)}"})
+            import traceback
+            return json.dumps({"error": f"Search failed: {str(e)}", "traceback": traceback.format_exc()})
 
     return mcp
 
