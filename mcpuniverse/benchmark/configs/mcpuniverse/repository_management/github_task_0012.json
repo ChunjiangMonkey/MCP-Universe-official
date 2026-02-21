@@ -1,6 +1,6 @@
 {
     "category": "general",
-    "question": "There are two repositories: QwenLM's Qwen2.5-VL and deepseek-ai's DeepSeek-VL2. Fork the repository with the fewest open issues, maintaining the same name as the source repository. If Qwen2.5-VL is forked, add a reference link at the bottom of the README.md file: 'Related project: [DeepSeek-VL2](the link of DeepSeek-VL2 repo)'. If DeepSeek-VL2 is forked, add a reference link at the bottom of the README.md file: 'Related project: [Qwen2.5-VL](the link of Qwen2.5-VL repo)'.",
+    "question": "There are two repositories: QwenLM's Qwen3-VL and deepseek-ai's DeepSeek-VL2. Fork the repository with the fewest open issues, maintaining the same name as the source repository. If Qwen3-VL is forked, add a reference link at the bottom of the README.md file: 'Related project: [DeepSeek-VL2](the link of DeepSeek-VL2 repo)'. If DeepSeek-VL2 is forked, add a reference link at the bottom of the README.md file: 'Related project: [Qwen3-VL](the link of Qwen3-VL repo)'.",
     "use_specified_server": true,
     "mcp_servers": [
         {
@@ -14,7 +14,7 @@
             "op_args": {
                 "owner": "{{GITHUB_PERSONAL_ACCOUNT_NAME}}",
                 "repos": [
-                    "QwenLM/Qwen2.5-VL",
+                    "QwenLM/Qwen3-VL",
                     "deepseek-ai/DeepSeek-VL2"
                 ],
                 "issue_state": "open"
@@ -26,7 +26,7 @@
             "op_args": {
                 "owner": "{{GITHUB_PERSONAL_ACCOUNT_NAME}}",
                 "repos": [
-                    "QwenLM/Qwen2.5-VL",
+                    "QwenLM/Qwen3-VL",
                     "deepseek-ai/DeepSeek-VL2"
                 ],
                 "path": "README.md",
@@ -34,7 +34,7 @@
                 "issue_state": "open",
                 "file_content": [
                     "Related project: [DeepSeek-VL2](https://github.com/deepseek-ai/DeepSeek-VL2)",
-                    "Related project: [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL)"
+                    "Related project: [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL)"
                 ]
             }
         }

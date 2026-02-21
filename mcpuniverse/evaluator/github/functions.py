@@ -5,6 +5,7 @@ Evaluation functions for Github tasks
 import io
 import csv
 import json
+import re
 from typing import Optional, Literal, List, Tuple
 from mcpuniverse.evaluator.functions import compare_func
 from mcpuniverse.mcp.manager import MCPManager
@@ -13,8 +14,23 @@ from mcpuniverse.mcp.manager import MCPManager
 ##################################################################################
 # Utils Function for Github
 ##################################################################################
-async def github__check_repository(query: str, **kwargs):
+
+async def github__check_repository(owner: str, repo: str, **kwargs):
     """Check whether a Github repository exists."""
+    # Use list_branches to check if repository exists
+    branches = await github__list_branches(owner, repo, **kwargs)
+    if branches is None:
+        return {'total_count': 0, 'items': []}
+
+    # Return format compatible with original function
+    return {
+        'total_count': 1,
+        'items': [{'full_name': f"{owner}/{repo}"}]
+    }
+
+
+async def github__search_repositories(query: str, **kwargs):
+    """Search Github repositories."""
     manager = MCPManager(context=kwargs.get("context", None))
 
     # search repositories in github MCP might be crashed, so we need to catch the error
@@ -43,7 +59,7 @@ async def github__get_file_contents(owner: str, repo: str, path: str, branch: Op
         "path": path
     }
     if branch:
-        args["ref"] = branch
+        args["branch"] = branch
 
     # get file contents in github MCP might be crashed, so we need to catch the error
     try:
@@ -191,12 +207,17 @@ async def github__get_issue_comments(owner: str, repo: str, issue_number: int, *
 async def github_check_repository(x: dict, *args, **kwargs) -> Tuple[bool, str]:
     """Check whether a Github repository exists."""
     _, query = args
-    repos = await github__check_repository(query, **kwargs)
+    match = re.search(r'(?:repo:)?([^/\s]+)/([^\s]+)', query)
+    if not match:
+        return False, "query format is incorrect"
+    owner = match.group(1)
+    repo = match.group(2)
+    repos = await github__check_repository(owner, repo, **kwargs)
     if repos is None or repos['total_count'] == 0:
         return False, "the repository doesn't exist"
 
     full_names = [repo['full_name'] for repo in repos['items']]
-    if query in full_names:
+    if f"{owner}/{repo}" in full_names:
         return True, ""
     return False, "the repository doesn't exist"
 
@@ -219,7 +240,6 @@ async def github_check_branches_exist(x: dict, *args, **kwargs) -> Tuple[bool, s
 async def github_check_file_content(x: dict, *args, **kwargs) -> Tuple[bool, str]:
     """Check if file content is valid."""
     value, op_args = args
-
     resp = await github__get_file_contents(
             op_args['owner'], op_args['repo'], op_args['path'], op_args['branch'], **kwargs)
 
@@ -234,7 +254,6 @@ async def github_check_file_content(x: dict, *args, **kwargs) -> Tuple[bool, str
         return False, "the file content is not found"
     if expected_file_content == "":
         return False, "the expected file content is not found"
-
     if not expected_file_content.strip() == resp.strip():
         return False, "the file content is incorrect!"
     return True, ""
@@ -289,8 +308,8 @@ async def github_check_file_content_and_issue_count(x: dict, *args, **kwargs) ->
     """Check if CSV files are valid and the number of rows matches the number of issues."""
 
     async def _get_groundtruth_repo_list(repo_owner, repo_name, issue_state, issue_labels):
-        repo_list = await github__check_repository(f"user:{repo_owner} {repo_name} in:name",
-                                                   **kwargs)
+        repo_list = await github__search_repositories(f"user:{repo_owner} {repo_name} in:name",
+                                                      **kwargs)
         if repo_list is None:
             return None
         ret = {}
@@ -381,7 +400,8 @@ async def github_check_repository_with_fewest_issues(x: dict, *args, **kwargs) -
         if len(issues) < fewest_issues_count:
             fewest_issues_count = len(issues)
             fewest_issues_repo_name = repo_name
-    repos_check = await github__check_repository(f"repo:{owner}/{fewest_issues_repo_name} fork:true")
+    # repos_check = await github__check_repository(f"repo:{owner}/{fewest_issues_repo_name} fork:true")
+    repos_check = await github__check_repository(owner, fewest_issues_repo_name)
 
     if repos_check is None or repos_check['total_count'] == 0:
         return False, "the repository doesn't exist"
@@ -410,8 +430,11 @@ async def github_check_file_content_with_fewest_issues(x: dict, *args, **kwargs)
             fewest_issues_count = len(issues)
             fewest_issues_repo_name = repo_name
             fewest_issues_repo_id = repo_id
+    # repos_check = await github__check_repository(
+    #     f"repo:{owner}/{fewest_issues_repo_name} fork:true"
+    # )
     repos_check = await github__check_repository(
-        f"repo:{owner}/{fewest_issues_repo_name} fork:true"
+        owner, fewest_issues_repo_name
     )
 
     if repos_check is None or repos_check['total_count'] == 0:

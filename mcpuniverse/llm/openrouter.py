@@ -41,7 +41,8 @@ model_name_map = {
     "Grok4_1Fast_Thinking_OR": "x-ai/grok-4.1-fast",
     "GPT5_1_Medium_OR": "openai/gpt-5.1",
     "GPT5_Medium_OR": "openai/gpt-5",
-    "DeepSeekV3_2_OR": "deepseek/deepseek-v3.2"
+    "DeepSeekV3_2_OR": "deepseek/deepseek-v3.2",
+    "Kimik2_5_OR": "moonshotai/kimi-k2.5",
 }
 
 @dataclass
