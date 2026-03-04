@@ -3,7 +3,7 @@ spec:
   name: llm-1
   type: openrouter
   config:
-    model_name: Kimik2_5_OR
+    model_name: Qwen3_30_Thinking_OR
     # reasoning: high
 
 ---

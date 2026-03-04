@@ -21,28 +21,11 @@ from .base import BaseLLM
 load_dotenv()
 
 model_name_map = {
-    "Qwen3Coder_OR": "qwen/qwen3-coder",
-    "GrokCoderFast1_OR": "x-ai/grok-code-fast-1",
-    "GPTOSS120B_OR": "openai/gpt-oss-120b",
-    "GPTOSS20B_OR": "openai/gpt-oss-20b",
-    "DeepSeekV3_1_OR": "deepseek/deepseek-chat-v3.1",
-    "GLM4_5_OR": "z-ai/glm-4.5",
-    "GLM4_5_AIR_OR": "z-ai/glm-4.5-air",
-    "GLM4_6_OR": "z-ai/glm-4.6",
-    "KimiK2_OR": "moonshotai/kimi-k2",
-    "Qwen3Max_OR": "qwen/qwen3-max",
-    "KimiK2_0905_OR": "moonshotai/kimi-k2-0905",
-    "DeepSeekV3_1_Terminus_OR": "deepseek/deepseek-v3.1-terminus",
-    "DeepSeekV3_2_EXP_OR": "deepseek/deepseek-v3.2-exp",
-    "ClaudeSonnet4_5_OR": "anthropic/claude-sonnet-4.5",
-    "ClaudeHaiku4_5_OR": "anthropic/claude-haiku-4.5",
-    "Ling1T_OR": "inclusionai/ling-1t",
-    "Gemini3ProPreview_OR": "google/gemini-3-pro-preview",
-    "Grok4_1Fast_Thinking_OR": "x-ai/grok-4.1-fast",
-    "GPT5_1_Medium_OR": "openai/gpt-5.1",
+    "Qwen3_30_Thinking_OR": "qwen/qwen3-30b-a3b-thinking-2507",
     "GPT5_Medium_OR": "openai/gpt-5",
     "DeepSeekV3_2_OR": "deepseek/deepseek-v3.2",
     "Kimik2_5_OR": "moonshotai/kimi-k2.5",
+    "TONGYI_DR_OR":"alibaba/tongyi-deepresearch-30b-a3b"
 }
 
 @dataclass
