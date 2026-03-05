@@ -3,7 +3,7 @@ spec:
   name: llm-1
   type: openrouter
   config:
-    model_name: Kimik2_5_OR
+    model_name: glm
 
 ---
 kind: agent
@@ -23,32 +23,32 @@ spec:
   agent: function-call-agent
   tasks:
     - mcpuniverse/multi_server/multi-server_task_weather_google_map_0001.json
-    # - mcpuniverse/multi_server/multi-server_task_weather_google_map_0002.json
-    # - mcpuniverse/multi_server/multi-server_task_weather_google_map_0003.json
-    # - mcpuniverse/multi_server/multi-server_task_weather_google_map_0004.json
-    # - mcpuniverse/multi_server/multi-server_task_weather_google_map_0005.json
+    - mcpuniverse/multi_server/multi-server_task_weather_google_map_0002.json
+    - mcpuniverse/multi_server/multi-server_task_weather_google_map_0003.json
+    - mcpuniverse/multi_server/multi-server_task_weather_google_map_0004.json
+    - mcpuniverse/multi_server/multi-server_task_weather_google_map_0005.json
 
-    # - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0001.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0002.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0003.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0004.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0005.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0001.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0002.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0003.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0004.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_google_map_0005.json
 
-    # - mcpuniverse/multi_server/multi-server_task_playwright_notion_0001.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_notion_0002.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_notion_0003.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_notion_0004.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_notion_0005.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_notion_0001.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_notion_0002.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_notion_0003.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_notion_0004.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_notion_0005.json
 
-    # - mcpuniverse/multi_server/multi-server_task_google_search_notion_0001.json
-    # - mcpuniverse/multi_server/multi-server_task_google_search_notion_0002.json
-    # - mcpuniverse/multi_server/multi-server_task_google_search_notion_0003.json
-    # - mcpuniverse/multi_server/multi-server_task_google_search_notion_0004.json
-    # - mcpuniverse/multi_server/multi-server_task_google_search_notion_0005.json
+    - mcpuniverse/multi_server/multi-server_task_google_search_notion_0001.json
+    - mcpuniverse/multi_server/multi-server_task_google_search_notion_0002.json
+    - mcpuniverse/multi_server/multi-server_task_google_search_notion_0003.json
+    - mcpuniverse/multi_server/multi-server_task_google_search_notion_0004.json
+    - mcpuniverse/multi_server/multi-server_task_google_search_notion_0005.json
 
-    # - mcpuniverse/multi_server/multi-server_task_playwright_github_0001.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_github_0002.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_github_0003.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_github_0004.json
-    # - mcpuniverse/multi_server/multi-server_task_playwright_github_0005.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_github_0001.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_github_0002.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_github_0003.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_github_0004.json
+    - mcpuniverse/multi_server/multi-server_task_playwright_github_0005.json
 

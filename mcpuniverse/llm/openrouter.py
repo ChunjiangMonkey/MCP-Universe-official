@@ -21,11 +21,12 @@ from .base import BaseLLM
 load_dotenv()
 
 model_name_map = {
-    "Qwen3_30_Thinking_OR": "qwen/qwen3-30b-a3b-thinking-2507",
-    "GPT5_Medium_OR": "openai/gpt-5",
-    "DeepSeekV3_2_OR": "deepseek/deepseek-v3.2",
-    "Kimik2_5_OR": "moonshotai/kimi-k2.5",
-    "TONGYI_DR_OR":"alibaba/tongyi-deepresearch-30b-a3b"
+    "qwen3": "qwen/qwen3-30b-a3b-thinking-2507",
+    "gpt5": "openai/gpt-5",
+    "deepseek": "deepseek/deepseek-v3.2",
+    "kimi": "moonshotai/kimi-k2.5",
+    "tongyi":"alibaba/tongyi-deepresearch-30b-a3b",
+    "glm5":"z-ai/glm-5"
 }
 
 @dataclass
