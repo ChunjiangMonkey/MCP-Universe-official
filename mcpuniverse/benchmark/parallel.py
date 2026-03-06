@@ -130,24 +130,119 @@ def _load_github_tokens(csv_path: str) -> List[Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive semaphore
+# ---------------------------------------------------------------------------
+
+class AdaptiveSemaphore:
+    """An asyncio semaphore whose concurrency limit can be changed at runtime.
+
+    Built on :class:`asyncio.Condition` so that :meth:`set_limit` can wake up
+    waiters when the limit is *increased*, and simply block new acquisitions
+    when the limit is *decreased* (no pre-emption of already-running tasks).
+    """
+
+    def __init__(self, initial_limit: int, min_limit: int = 1) -> None:
+        if initial_limit < 1:
+            raise ValueError("initial_limit must be >= 1")
+        if min_limit < 1:
+            raise ValueError("min_limit must be >= 1")
+        self._limit = initial_limit
+        self._min_limit = min_limit
+        self._current = 0  # number of currently acquired slots
+        self._condition = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def current(self) -> int:
+        return self._current
+
+    async def set_limit(self, new_limit: int) -> None:
+        """Change the concurrency limit at runtime.
+
+        If *new_limit* is larger than the old limit, waiting acquirers are
+        woken up.  If smaller, no running tasks are interrupted — the
+        semaphore simply blocks new acquisitions until enough slots are freed.
+        """
+        new_limit = max(new_limit, self._min_limit)
+        async with self._condition:
+            old = self._limit
+            self._limit = new_limit
+            if new_limit > old:
+                self._condition.notify_all()
+
+    async def acquire(self) -> None:
+        async with self._condition:
+            while self._current >= self._limit:
+                await self._condition.wait()
+            self._current += 1
+
+    async def release(self) -> None:
+        async with self._condition:
+            self._current -= 1
+            self._condition.notify()
+
+    async def __aenter__(self) -> "AdaptiveSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[override]
+        await self.release()
+
+
+# ---------------------------------------------------------------------------
 # Feedback controller
 # ---------------------------------------------------------------------------
 
 class FeedbackController:
-    """Adaptive delay controller driven by recent worker error signals.
+    """Adaptive delay *and* concurrency controller driven by recent worker
+    error signals.
 
     Maintains a sliding window of the most recent *window_size* results and
     computes a cooldown period based on the frequency of each error category.
+
+    Additionally applies an **AIMD** (Additive Increase / Multiplicative
+    Decrease) strategy to dynamically adjust the concurrency limit exposed
+    via the :attr:`semaphore` property:
+
+    * **RATE_LIMIT** error  → halve concurrency (``current // 2``)
+    * **CONNECTION** error  → reduce concurrency by 25 % (``current * 3 // 4``)
+    * Other error categories → no concurrency change (handled by delay only)
+    * Consecutive successes ≥ ``window_size // 2`` → increase by 1 (up to
+      *initial_concurrency*)
     """
 
-    def __init__(self, window_size: int = 20, max_cooldown: float = 60.0):
+    def __init__(
+        self,
+        window_size: int = 20,
+        max_cooldown: float = 300.0,
+        initial_concurrency: int = 10,
+        min_concurrency: int = 1,
+    ):
         self._window: deque[WorkerResult] = deque(maxlen=window_size)
+        self._window_size = window_size
         self._max_cooldown = max_cooldown
         self._lock = asyncio.Lock()
 
-    def record(self, result: WorkerResult) -> None:
-        """Record a worker result into the sliding window."""
+        self._initial_concurrency = initial_concurrency
+        self._min_concurrency = min_concurrency
+        self._semaphore = AdaptiveSemaphore(
+            initial_limit=initial_concurrency,
+            min_limit=min_concurrency,
+        )
+        self._success_streak: int = 0
+
+    @property
+    def semaphore(self) -> AdaptiveSemaphore:
+        """The adaptive semaphore used to gate concurrent workers."""
+        return self._semaphore
+
+    async def record(self, result: WorkerResult) -> None:
+        """Record a worker result and apply AIMD concurrency adjustment."""
         self._window.append(result)
+        await self._aimd_adjust(result)
 
     def _compute_cooldown(self) -> float:
         if not self._window:
@@ -165,6 +260,29 @@ class FeedbackController:
             cooldown /= 2.0
 
         return min(cooldown, self._max_cooldown)
+
+    async def _aimd_adjust(self, result: WorkerResult) -> None:
+        """Apply AIMD concurrency adjustment based on *result*."""
+        cur = self._semaphore.limit
+
+        if not result.success:
+            self._success_streak = 0
+            if result.error_category == ErrorCategory.RATE_LIMIT:
+                new = max(cur // 2, self._min_concurrency)
+            elif result.error_category == ErrorCategory.CONNECTION:
+                new = max(cur * 3 // 4, self._min_concurrency)
+            else:
+                return  # TIMEOUT / AUTH / UNKNOWN — delay only
+            if new != cur:
+                await self._semaphore.set_limit(new)
+        else:
+            self._success_streak += 1
+            if (
+                self._success_streak >= self._window_size // 2
+                and cur < self._initial_concurrency
+            ):
+                await self._semaphore.set_limit(min(cur + 1, self._initial_concurrency))
+                self._success_streak = 0
 
     async def wait_before_launch(self) -> float:
         """Sleep for the computed cooldown period. Returns the actual delay."""
@@ -291,12 +409,16 @@ class ParallelBenchmarkRunner:
         output_dir: Optional[str] = None,
         max_retries: int = 2,
         github_tokens: Optional[str] = None,
+        min_concurrency: int = 1,
     ):
         self._config = config
         self._concurrency = concurrency
         self._output_dir = output_dir
         self._max_retries = max_retries
-        self._feedback = FeedbackController()
+        self._feedback = FeedbackController(
+            initial_concurrency=concurrency,
+            min_concurrency=min_concurrency,
+        )
         self._github_accounts: Optional[List[Tuple[str, str]]] = None
         if github_tokens:
             self._github_accounts = _load_github_tokens(github_tokens)
@@ -325,7 +447,7 @@ class ParallelBenchmarkRunner:
                     print(f"  [github] {task_path} -> {account[0]}")
 
             os.makedirs(self._output_dir, exist_ok=True)
-            semaphore = asyncio.Semaphore(self._concurrency)
+            semaphore = self._feedback.semaphore
 
             # First pass
             coros = []
@@ -408,7 +530,7 @@ class ParallelBenchmarkRunner:
         temp_yaml: str,
         output_json: str,
         log_path: str,
-        semaphore: asyncio.Semaphore,
+        semaphore: AdaptiveSemaphore,
         attempt: int = 1,
     ) -> WorkerResult:
         """Launch a single worker subprocess under semaphore control."""
@@ -484,7 +606,7 @@ class ParallelBenchmarkRunner:
             status = "\033[32mOK\033[0m" if wr.success else f"\033[31mFAIL ({wr.error_category.name})\033[0m"
             print(f"  [{attempt}] Finished: {task_path} — {status} ({duration:.1f}s)")
 
-            self._feedback.record(wr)
+            await self._feedback.record(wr)
             return wr
 
     @staticmethod
@@ -742,6 +864,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="(orchestrator) Max retry rounds for failed tasks (default: 2)",
     )
     parser.add_argument(
+        "--min-concurrency", type=int, default=1,
+        help="(orchestrator) Minimum concurrency when AIMD scales down (default: 1)",
+    )
+    parser.add_argument(
         "--github-tokens", default=None,
         help="(orchestrator) CSV file with GitHub accounts (username,token) for round-robin distribution",
     )
@@ -767,6 +893,7 @@ def main() -> None:
             output_dir=args.output_dir,
             max_retries=args.max_retries,
             github_tokens=args.github_tokens,
+            min_concurrency=args.min_concurrency,
         )
         asyncio.run(runner.run())
     else:

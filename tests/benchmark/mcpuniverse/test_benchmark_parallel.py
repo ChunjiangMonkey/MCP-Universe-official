@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from mcpuniverse.benchmark.parallel import (
+    AdaptiveSemaphore,
     ErrorCategory,
     FeedbackController,
     WorkerResult,
@@ -144,62 +145,62 @@ class TestFeedbackController(unittest.IsolatedAsyncioTestCase):
         fc = FeedbackController(window_size=10)
         self.assertEqual(fc._compute_cooldown(), 0.0)
 
-    def test_all_success_zero_cooldown(self):
+    async def test_all_success_zero_cooldown(self):
         fc = FeedbackController(window_size=10)
         for _ in range(5):
-            fc.record(self._make_result(success=True))
+            await fc.record(self._make_result(success=True))
         self.assertEqual(fc._compute_cooldown(), 0.0)
 
-    def test_rate_limit_increases_cooldown(self):
+    async def test_rate_limit_increases_cooldown(self):
         fc = FeedbackController(window_size=10)
-        fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
         # 1 rate_limit * 5.0 = 5.0, no recovery (0% success)
         self.assertAlmostEqual(fc._compute_cooldown(), 5.0)
 
-    def test_multiple_error_types(self):
+    async def test_multiple_error_types(self):
         fc = FeedbackController(window_size=10)
-        fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
-        fc.record(self._make_result(success=False, category=ErrorCategory.TIMEOUT))
-        fc.record(self._make_result(success=False, category=ErrorCategory.CONNECTION))
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        await fc.record(self._make_result(success=False, category=ErrorCategory.TIMEOUT))
+        await fc.record(self._make_result(success=False, category=ErrorCategory.CONNECTION))
         # 5 + 2 + 3 = 10.0
         self.assertAlmostEqual(fc._compute_cooldown(), 10.0)
 
-    def test_max_cooldown_cap(self):
+    async def test_max_cooldown_cap(self):
         fc = FeedbackController(window_size=100, max_cooldown=30.0)
         for _ in range(20):
-            fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+            await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
         # 20 * 5.0 = 100.0, capped at 30.0
         self.assertAlmostEqual(fc._compute_cooldown(), 30.0)
 
-    def test_recovery_halves_cooldown(self):
+    async def test_recovery_halves_cooldown(self):
         fc = FeedbackController(window_size=10)
         # 2 rate limit errors + 8 successes = 80% success
         for _ in range(2):
-            fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+            await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
         for _ in range(8):
-            fc.record(self._make_result(success=True))
+            await fc.record(self._make_result(success=True))
         # 2 * 5.0 = 10.0, halved due to 80% success => 5.0
         self.assertAlmostEqual(fc._compute_cooldown(), 5.0)
 
-    def test_below_recovery_threshold_no_halving(self):
+    async def test_below_recovery_threshold_no_halving(self):
         fc = FeedbackController(window_size=10)
         # 3 rate limit errors + 7 successes = 70% success (below 80%)
         for _ in range(3):
-            fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+            await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
         for _ in range(7):
-            fc.record(self._make_result(success=True))
+            await fc.record(self._make_result(success=True))
         # 3 * 5.0 = 15.0, no halving
         self.assertAlmostEqual(fc._compute_cooldown(), 15.0)
 
-    def test_sliding_window_eviction(self):
+    async def test_sliding_window_eviction(self):
         fc = FeedbackController(window_size=5)
         # Fill window with errors
         for _ in range(5):
-            fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+            await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
         self.assertAlmostEqual(fc._compute_cooldown(), 25.0)
         # Push out all errors with successes
         for _ in range(5):
-            fc.record(self._make_result(success=True))
+            await fc.record(self._make_result(success=True))
         self.assertAlmostEqual(fc._compute_cooldown(), 0.0)
 
     async def test_wait_before_launch_no_delay(self):
@@ -294,6 +295,156 @@ class TestYamlSplitting(unittest.TestCase):
             self.assertEqual(parsed[1]["kind"], "benchmark")
         finally:
             os.unlink(config_path)
+
+
+class TestAdaptiveSemaphore(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for AdaptiveSemaphore."""
+
+    async def test_basic_acquire_release(self):
+        sem = AdaptiveSemaphore(initial_limit=2)
+        await sem.acquire()
+        self.assertEqual(sem.current, 1)
+        await sem.release()
+        self.assertEqual(sem.current, 0)
+
+    async def test_context_manager(self):
+        sem = AdaptiveSemaphore(initial_limit=2)
+        async with sem:
+            self.assertEqual(sem.current, 1)
+        self.assertEqual(sem.current, 0)
+
+    async def test_blocks_at_limit(self):
+        sem = AdaptiveSemaphore(initial_limit=1)
+        await sem.acquire()
+
+        acquired = asyncio.Event()
+
+        async def _try_acquire():
+            await sem.acquire()
+            acquired.set()
+
+        task = asyncio.create_task(_try_acquire())
+        await asyncio.sleep(0.05)
+        self.assertFalse(acquired.is_set())
+
+        await sem.release()
+        await asyncio.sleep(0.05)
+        self.assertTrue(acquired.is_set())
+        await sem.release()
+        task.cancel()
+
+    async def test_set_limit_increase_wakes_waiters(self):
+        sem = AdaptiveSemaphore(initial_limit=1)
+        await sem.acquire()  # slot full
+
+        acquired = asyncio.Event()
+
+        async def _try_acquire():
+            await sem.acquire()
+            acquired.set()
+
+        task = asyncio.create_task(_try_acquire())
+        await asyncio.sleep(0.05)
+        self.assertFalse(acquired.is_set())
+
+        await sem.set_limit(2)
+        await asyncio.sleep(0.05)
+        self.assertTrue(acquired.is_set())
+
+        await sem.release()
+        await sem.release()
+        task.cancel()
+
+    async def test_set_limit_decrease_no_preemption(self):
+        sem = AdaptiveSemaphore(initial_limit=3)
+        await sem.acquire()
+        await sem.acquire()
+        self.assertEqual(sem.current, 2)
+
+        await sem.set_limit(1)
+        # Already acquired slots still held, no error
+        self.assertEqual(sem.current, 2)
+        self.assertEqual(sem.limit, 1)
+
+        await sem.release()
+        await sem.release()
+
+    async def test_min_limit_enforced(self):
+        sem = AdaptiveSemaphore(initial_limit=5, min_limit=2)
+        await sem.set_limit(1)
+        self.assertEqual(sem.limit, 2)
+
+    async def test_constructor_validation(self):
+        with self.assertRaises(ValueError):
+            AdaptiveSemaphore(initial_limit=0)
+        with self.assertRaises(ValueError):
+            AdaptiveSemaphore(initial_limit=1, min_limit=0)
+
+
+class TestFeedbackControllerAIMD(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the AIMD concurrency adjustment in FeedbackController."""
+
+    @staticmethod
+    def _make_result(success: bool, category: ErrorCategory = ErrorCategory.UNKNOWN) -> WorkerResult:
+        return WorkerResult(
+            task_path="test/task.json",
+            success=success,
+            error_category=category if not success else ErrorCategory.UNKNOWN,
+        )
+
+    async def test_rate_limit_halves_concurrency(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=10)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        self.assertEqual(fc.semaphore.limit, 5)
+
+    async def test_connection_reduces_by_quarter(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=8)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.CONNECTION))
+        # 8 * 3 // 4 = 6
+        self.assertEqual(fc.semaphore.limit, 6)
+
+    async def test_timeout_no_concurrency_change(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=10)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.TIMEOUT))
+        self.assertEqual(fc.semaphore.limit, 10)
+
+    async def test_auth_no_concurrency_change(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=10)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.AUTH))
+        self.assertEqual(fc.semaphore.limit, 10)
+
+    async def test_unknown_no_concurrency_change(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=10)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.UNKNOWN))
+        self.assertEqual(fc.semaphore.limit, 10)
+
+    async def test_consecutive_success_recovers(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=10, min_concurrency=1)
+        # First reduce concurrency
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        self.assertEqual(fc.semaphore.limit, 5)
+        # Need window_size // 2 = 10 consecutive successes to increase by 1
+        for _ in range(10):
+            await fc.record(self._make_result(success=True))
+        self.assertEqual(fc.semaphore.limit, 6)
+
+    async def test_recovery_does_not_exceed_initial(self):
+        fc = FeedbackController(window_size=4, initial_concurrency=3, min_concurrency=1)
+        # Already at initial — streak of successes should not increase beyond it
+        for _ in range(10):
+            await fc.record(self._make_result(success=True))
+        self.assertEqual(fc.semaphore.limit, 3)
+
+    async def test_min_concurrency_floor(self):
+        fc = FeedbackController(window_size=20, initial_concurrency=2, min_concurrency=2)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        # 2 // 2 = 1, but min is 2
+        self.assertEqual(fc.semaphore.limit, 2)
+
+    async def test_semaphore_property(self):
+        fc = FeedbackController(initial_concurrency=5, min_concurrency=2)
+        self.assertIsInstance(fc.semaphore, AdaptiveSemaphore)
+        self.assertEqual(fc.semaphore.limit, 5)
 
 
 @pytest.mark.skip(reason="Integration test: requires LLM and MCP services")
