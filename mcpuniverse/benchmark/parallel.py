@@ -5,8 +5,11 @@ Orchestrates concurrent execution of benchmark tasks by splitting a multi-task
 YAML config into single-task configs and running each in a separate subprocess.
 
 Usage:
-    # Orchestrator mode (default)
+    # Orchestrator mode — single config
     python -m mcpuniverse.benchmark.parallel config.yaml --concurrency 20
+
+    # Orchestrator mode — multiple configs pooled into one run
+    python -m mcpuniverse.benchmark.parallel a.yaml b.yaml c.yaml --concurrency 20
 
     # Worker mode (called internally by orchestrator)
     python -m mcpuniverse.benchmark.parallel --worker config.yaml --output result.json --log-file trace.log
@@ -27,7 +30,7 @@ import psutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -413,11 +416,16 @@ async def _run_worker(config_path: str, output_path: str, log_file: str) -> None
 # ---------------------------------------------------------------------------
 
 class ParallelBenchmarkRunner:
-    """Run benchmark tasks concurrently using subprocess workers."""
+    """Run benchmark tasks concurrently using subprocess workers.
+
+    *config* accepts a single YAML path (str) or a list of paths.  When
+    multiple configs are provided their tasks are pooled into one shared
+    concurrency pool while each task keeps its own llm/agent definition.
+    """
 
     def __init__(
         self,
-        config: str,
+        config: Union[str, List[str]],
         concurrency: int = 10,
         output_dir: Optional[str] = None,
         max_retries: int = 2,
@@ -425,7 +433,10 @@ class ParallelBenchmarkRunner:
         min_concurrency: int = 1,
         memory_threshold: float = 0.6,
     ):
-        self._config = config
+        if isinstance(config, str):
+            self._configs: List[str] = [config]
+        else:
+            self._configs = list(config)
         self._concurrency = concurrency
         self._output_dir = output_dir
         self._max_retries = max_retries
@@ -439,18 +450,24 @@ class ParallelBenchmarkRunner:
             self._github_accounts = _load_github_tokens(github_tokens)
 
     async def run(self) -> List[BenchmarkResult]:
-        """Split config, run workers concurrently, merge and return results."""
+        """Split config(s), run workers concurrently, merge and return results."""
         if not self._output_dir:
-            config_name = os.path.splitext(os.path.basename(self._config))[0]
+            if len(self._configs) == 1:
+                config_name = os.path.splitext(os.path.basename(self._configs[0]))[0]
+            else:
+                config_name = "multi_benchmark"
             self._output_dir = os.path.join("results", config_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._output_dir = f"{self._output_dir}_{timestamp}"
 
         temp_dir = tempfile.mkdtemp(prefix="mcpu_parallel_")
         try:
-            task_items = _split_into_single_task_yamls(self._config, temp_dir)
+            task_items: List[Tuple[str, str]] = []
+            for cfg_idx, cfg_path in enumerate(self._configs):
+                sub_dir = os.path.join(temp_dir, f"config_{cfg_idx}")
+                task_items.extend(_split_into_single_task_yamls(cfg_path, sub_dir))
             if not task_items:
-                print("No tasks found in config.")
+                print("No tasks found in config(s).")
                 return []
 
             # Round-robin assign GitHub accounts to tasks
@@ -520,7 +537,7 @@ class ParallelBenchmarkRunner:
                     for wr in worker_results
                 ]
 
-            merged = self._merge_results(self._config, worker_results)
+            merged = self._merge_results(self._configs, worker_results)
             self._print_summary(worker_results)
             self._print_evaluation_summary(merged)
 
@@ -626,48 +643,44 @@ class ParallelBenchmarkRunner:
 
     @staticmethod
     def _merge_results(
-        config_path: str,
+        config_paths: List[str],
         worker_results: List[WorkerResult],
     ) -> List[BenchmarkResult]:
         """Merge worker results into BenchmarkResult objects compatible with the serial runner."""
-        docs = _parse_config_documents(config_path)
-
-        non_benchmark_docs = []
-        benchmark_docs = []
-        for doc in docs:
-            if doc.get("kind", "").lower() == "benchmark":
-                benchmark_docs.append(doc)
-            else:
-                non_benchmark_docs.append(doc)
-
         # Index worker results by task_path
         wr_map: Dict[str, WorkerResult] = {}
         for wr in worker_results:
             wr_map[wr.task_path] = wr
 
         merged: List[BenchmarkResult] = []
-        for bench_doc in benchmark_docs:
-            bench_config = BenchmarkConfig.model_validate(bench_doc["spec"])
-            task_results: Dict[str, Dict] = {}
-            task_trace_ids: Dict[str, str] = {}
+        for config_path in config_paths:
+            docs = _parse_config_documents(config_path)
+            benchmark_docs = [
+                d for d in docs if d.get("kind", "").lower() == "benchmark"
+            ]
 
-            for task_path in bench_config.tasks:
-                wr = wr_map.get(task_path)
-                if wr and wr.success and wr.evaluation_results is not None:
-                    eval_objs = [
-                        EvaluationResult.model_validate(e) for e in wr.evaluation_results
-                    ]
-                    task_results[task_path] = {"evaluation_results": eval_objs}
-                    task_trace_ids[task_path] = wr.trace_id
-                else:
-                    task_results[task_path] = {"evaluation_results": []}
-                    task_trace_ids[task_path] = ""
+            for bench_doc in benchmark_docs:
+                bench_config = BenchmarkConfig.model_validate(bench_doc["spec"])
+                task_results: Dict[str, Dict] = {}
+                task_trace_ids: Dict[str, str] = {}
 
-            merged.append(BenchmarkResult(
-                benchmark=bench_config,
-                task_results=task_results,
-                task_trace_ids=task_trace_ids,
-            ))
+                for task_path in bench_config.tasks:
+                    wr = wr_map.get(task_path)
+                    if wr and wr.success and wr.evaluation_results is not None:
+                        eval_objs = [
+                            EvaluationResult.model_validate(e) for e in wr.evaluation_results
+                        ]
+                        task_results[task_path] = {"evaluation_results": eval_objs}
+                        task_trace_ids[task_path] = wr.trace_id
+                    else:
+                        task_results[task_path] = {"evaluation_results": []}
+                        task_trace_ids[task_path] = ""
+
+                merged.append(BenchmarkResult(
+                    benchmark=bench_config,
+                    task_results=task_results,
+                    task_trace_ids=task_trace_ids,
+                ))
 
         return merged
 
@@ -863,8 +876,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "config",
-        nargs="?",
-        help="(orchestrator) Benchmark config YAML path",
+        nargs="*",
+        help="(orchestrator) Benchmark config YAML path(s); multiple configs are pooled into one run",
     )
     parser.add_argument(
         "--concurrency", type=int, default=10,
@@ -905,7 +918,7 @@ def main() -> None:
             parser.error("--log-file is required in worker mode")
         asyncio.run(_run_worker(args.worker, args.output, args.log_file))
     elif args.config:
-        # Orchestrator mode
+        # Orchestrator mode — single config or multiple configs pooled
         runner = ParallelBenchmarkRunner(
             config=args.config,
             concurrency=args.concurrency,
@@ -917,7 +930,7 @@ def main() -> None:
         )
         asyncio.run(runner.run())
     else:
-        parser.error("Provide a config path or use --worker mode")
+        parser.error("Provide config path(s) or use --worker mode")
 
 
 if __name__ == "__main__":
