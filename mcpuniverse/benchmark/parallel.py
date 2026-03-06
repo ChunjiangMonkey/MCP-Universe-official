@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 from collections import deque
+
+import psutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -212,6 +214,7 @@ class FeedbackController:
     * Other error categories → no concurrency change (handled by delay only)
     * Consecutive successes ≥ ``window_size // 2`` → increase by 1 (up to
       *initial_concurrency*)
+    * Memory usage exceeds *memory_threshold* → halve concurrency (``current // 2``)
     """
 
     def __init__(
@@ -220,6 +223,7 @@ class FeedbackController:
         max_cooldown: float = 300.0,
         initial_concurrency: int = 10,
         min_concurrency: int = 1,
+        memory_threshold: float = 0.6,
     ):
         self._window: deque[WorkerResult] = deque(maxlen=window_size)
         self._window_size = window_size
@@ -228,6 +232,7 @@ class FeedbackController:
 
         self._initial_concurrency = initial_concurrency
         self._min_concurrency = min_concurrency
+        self._memory_threshold = memory_threshold
         self._semaphore = AdaptiveSemaphore(
             initial_limit=initial_concurrency,
             min_limit=min_concurrency,
@@ -283,6 +288,14 @@ class FeedbackController:
             ):
                 await self._semaphore.set_limit(min(cur + 1, self._initial_concurrency))
                 self._success_streak = 0
+
+        # Memory pressure check
+        mem = psutil.virtual_memory()
+        if mem.percent > self._memory_threshold * 100:
+            cur = self._semaphore.limit  # re-read after possible AIMD change
+            new = max(cur // 2, self._min_concurrency)
+            if new != cur:
+                await self._semaphore.set_limit(new)
 
     async def wait_before_launch(self) -> float:
         """Sleep for the computed cooldown period. Returns the actual delay."""
@@ -410,6 +423,7 @@ class ParallelBenchmarkRunner:
         max_retries: int = 2,
         github_tokens: Optional[str] = None,
         min_concurrency: int = 1,
+        memory_threshold: float = 0.6,
     ):
         self._config = config
         self._concurrency = concurrency
@@ -418,6 +432,7 @@ class ParallelBenchmarkRunner:
         self._feedback = FeedbackController(
             initial_concurrency=concurrency,
             min_concurrency=min_concurrency,
+            memory_threshold=memory_threshold,
         )
         self._github_accounts: Optional[List[Tuple[str, str]]] = None
         if github_tokens:
@@ -868,6 +883,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="(orchestrator) Minimum concurrency when AIMD scales down (default: 1)",
     )
     parser.add_argument(
+        "--memory-threshold", type=float, default=0.6,
+        help="(orchestrator) Memory usage threshold (0-1) to halve concurrency (default: 0.6)",
+    )
+    parser.add_argument(
         "--github-tokens", default=None,
         help="(orchestrator) CSV file with GitHub accounts (username,token) for round-robin distribution",
     )
@@ -894,6 +913,7 @@ def main() -> None:
             max_retries=args.max_retries,
             github_tokens=args.github_tokens,
             min_concurrency=args.min_concurrency,
+            memory_threshold=args.memory_threshold,
         )
         asyncio.run(runner.run())
     else:

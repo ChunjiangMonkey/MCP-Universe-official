@@ -5,6 +5,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -445,6 +446,42 @@ class TestFeedbackControllerAIMD(unittest.IsolatedAsyncioTestCase):
         fc = FeedbackController(initial_concurrency=5, min_concurrency=2)
         self.assertIsInstance(fc.semaphore, AdaptiveSemaphore)
         self.assertEqual(fc.semaphore.limit, 5)
+
+    @patch("mcpuniverse.benchmark.parallel.psutil.virtual_memory")
+    async def test_memory_pressure_halves_concurrency(self, mock_vmem):
+        """When memory > 60%, even a successful record should halve concurrency."""
+        mock_vmem.return_value.percent = 75.0  # above 60% threshold
+        fc = FeedbackController(window_size=20, initial_concurrency=10, memory_threshold=0.6)
+        await fc.record(self._make_result(success=True))
+        self.assertEqual(fc.semaphore.limit, 5)
+
+    @patch("mcpuniverse.benchmark.parallel.psutil.virtual_memory")
+    async def test_memory_below_threshold_no_change(self, mock_vmem):
+        """When memory < 60%, concurrency should remain unchanged after a success."""
+        mock_vmem.return_value.percent = 50.0  # below 60% threshold
+        fc = FeedbackController(window_size=20, initial_concurrency=10, memory_threshold=0.6)
+        await fc.record(self._make_result(success=True))
+        self.assertEqual(fc.semaphore.limit, 10)
+
+    @patch("mcpuniverse.benchmark.parallel.psutil.virtual_memory")
+    async def test_memory_pressure_respects_min_concurrency(self, mock_vmem):
+        """Memory pressure should not reduce concurrency below min_concurrency."""
+        mock_vmem.return_value.percent = 90.0
+        fc = FeedbackController(
+            window_size=20, initial_concurrency=2, min_concurrency=2, memory_threshold=0.6,
+        )
+        await fc.record(self._make_result(success=True))
+        # 2 // 2 = 1 but min is 2, so no change
+        self.assertEqual(fc.semaphore.limit, 2)
+
+    @patch("mcpuniverse.benchmark.parallel.psutil.virtual_memory")
+    async def test_memory_pressure_stacks_with_rate_limit(self, mock_vmem):
+        """Rate-limit AIMD + memory pressure should stack (10 -> 5 -> 2)."""
+        mock_vmem.return_value.percent = 80.0
+        fc = FeedbackController(window_size=20, initial_concurrency=10, memory_threshold=0.6)
+        await fc.record(self._make_result(success=False, category=ErrorCategory.RATE_LIMIT))
+        # rate-limit: 10 -> 5, then memory: 5 -> 2
+        self.assertEqual(fc.semaphore.limit, 2)
 
 
 @pytest.mark.skip(reason="Integration test: requires LLM and MCP services")
