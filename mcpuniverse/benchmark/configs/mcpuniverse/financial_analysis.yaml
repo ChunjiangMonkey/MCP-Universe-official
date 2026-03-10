@@ -3,7 +3,8 @@ spec:
   name: llm-1
   type: openai
   config:
-    model_name: qwen7
+    model_name: qwen8
+
 
 ---
 kind: agent
@@ -18,6 +19,8 @@ spec:
     servers:
       - name: yfinance
       - name: calculator
+    use_custom_tools: true
+    
 
 ---
 kind: benchmark

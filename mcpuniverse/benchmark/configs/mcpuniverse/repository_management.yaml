@@ -3,7 +3,7 @@ spec:
   name: llm-1
   type: openai
   config:
-    model_name: qwen7
+    model_name: qwen8
 
 ---
 kind: agent
@@ -15,6 +15,7 @@ spec:
     instruction: You are an agent for repository management.
     max_iterations: 50
     summarize_tool_response: false
+    use_custom_tools: true
 
 ---
 kind: benchmark

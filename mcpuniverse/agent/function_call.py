@@ -26,6 +26,62 @@ from .types import AgentResponse
 
 DEFAULT_CONFIG_FOLDER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
+CUSTOM_TOOL_ANSWER = {
+    "type": "function",
+    "function": {
+        "name": "answer",
+        "description": (
+            "Report the final answer or result summary for the completed task.\n\n"
+            "Call this tool ONCE at the very end, after you have fully completed "
+            "the task. Provide a clear, complete summary of your findings or results."
+        ),
+        "parameters": {
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+            "type": "object"
+        }
+    }
+}
+
+CUSTOM_TOOL_WRITE_TODOS = {
+    "type": "function",
+    "function": {
+        "name": "write_todos",
+        "description": (
+            "Use this tool to create and manage a structured task list for your "
+            "current work session. This helps you track progress, organize complex "
+            "tasks, and demonstrate thoroughness to the user.\n\n"
+            "Only use this tool if you think it will be helpful in staying organized. "
+            "If the user's request is trivial and takes less than 3 steps, it is "
+            "better to NOT use this tool and just do the task directly."
+        ),
+        "parameters": {
+            "properties": {
+                "todos": {
+                    "items": {
+                        "description": "A single todo item with content and status.",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "enum": ["pending", "in_progress", "completed"],
+                                "type": "string"
+                            }
+                        },
+                        "required": ["content", "status"],
+                        "type": "object"
+                    },
+                    "type": "array"
+                },
+                "tool_call_id": {"type": "string"}
+            },
+            "required": ["todos", "tool_call_id"],
+            "type": "object"
+        }
+    }
+}
+
+CUSTOM_TOOL_NAMES = {"answer", "write_todos"}
+
 
 @dataclass
 class FunctionCallConfig(BaseAgentConfig):
@@ -42,6 +98,7 @@ class FunctionCallConfig(BaseAgentConfig):
     context_examples: str = ""
     max_iterations: int = 5
     summarize_tool_response: bool = False
+    use_custom_tools: bool = False
 
 
 class FunctionCall(BaseAgent):
@@ -206,8 +263,13 @@ class FunctionCall(BaseAgent):
         params.update(self._config.template_vars)
         # Note: HISTORY is no longer included in prompt as we use conversation format
         # Don't include tools in the prompt since we use function calling
+        system_prompt = self._config.system_prompt
+        if self._config.use_custom_tools:
+            system_prompt = os.path.join(
+                DEFAULT_CONFIG_FOLDER, "custom_function_call_prompt.j2"
+            )
         return build_system_prompt(
-            system_prompt_template=self._config.system_prompt,
+            system_prompt_template=system_prompt,
             tool_prompt_template="",  # No tool prompt needed
             tools=None,  # No tools in text format
             **params
@@ -408,6 +470,8 @@ class FunctionCall(BaseAgent):
 
         # Convert MCP tools to function call format
         tools = self._convert_mcp_tools_to_function_calls(self._tools) if self._tools else []
+        if self._config.use_custom_tools:
+            tools.extend([CUSTOM_TOOL_ANSWER, CUSTOM_TOOL_WRITE_TODOS])
 
         # Build initial system prompt (without history)
         initial_prompt = self._build_prompt(message)
@@ -531,7 +595,7 @@ class FunctionCall(BaseAgent):
 
                 if has_tool_calls:
                     # Handle function calls first
-                    await self._handle_function_calls(
+                    answer_response = await self._handle_function_calls(
                         message_obj.tool_calls,
                         message_obj.reasoning_details if has_reasoning_details else None,
                         messages,
@@ -539,6 +603,8 @@ class FunctionCall(BaseAgent):
                         tracer,
                         callbacks
                     )
+                    if answer_response is not None:
+                        return answer_response
                     # If there's also content, process it as additional thought/reasoning
                     if has_content:
                         content = message_obj.content.strip()
@@ -636,7 +702,7 @@ class FunctionCall(BaseAgent):
             iter_num: int,
             tracer: Tracer,
             callbacks: List[Any]
-    ):
+    ) -> Optional[AgentResponse]:
         """
         Handle function calls from the LLM response.
 
@@ -647,6 +713,10 @@ class FunctionCall(BaseAgent):
             iter_num: Current iteration number
             tracer: Tracer for logging
             callbacks: Callbacks for logging
+
+        Returns:
+            Optional[AgentResponse]: An AgentResponse if the 'answer' custom tool
+                was called, None otherwise.
         """
         # Add assistant message with tool calls to conversation
         assistant_message = {
@@ -683,6 +753,71 @@ class FunctionCall(BaseAgent):
                     function_name = tool_call.function.name
                     function_arguments = tool_call.function.arguments
                     tool_call_id = tool_call.id
+
+                # Intercept custom tools (answer, write_todos)
+                if (self._config.use_custom_tools
+                        and function_name in CUSTOM_TOOL_NAMES):
+                    # Parse arguments
+                    if isinstance(function_arguments, str):
+                        arguments = json.loads(function_arguments)
+                    else:
+                        arguments = function_arguments
+
+                    self._add_history(
+                        history_type="action",
+                        message=f"Using custom tool `{function_name}`"
+                    )
+                    self._add_history(
+                        history_type="action input",
+                        message=str(arguments)
+                    )
+
+                    await send_message_async(
+                        callbacks,
+                        message=CallbackMessage(
+                            source=__file__,
+                            type=MessageType.LOG,
+                            metadata={
+                                "event": "plain_text",
+                                "data": "".join([
+                                    f"{'=' * 66}\n",
+                                    f"Iteration: {iter_num + 1}\n",
+                                    f"{'-' * 66}\n",
+                                    f"\033[31mCustom Tool: {function_name}\n\n\033[0m",
+                                    f"\033[33mArguments: {json.dumps(arguments)}\n\033[0m",
+                                ])
+                            }
+                        )
+                    )
+
+                    if function_name == "answer":
+                        answer_content = arguments.get("content", "")
+                        self._add_history(
+                            history_type="answer",
+                            message=answer_content
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": "Answer recorded."
+                        })
+                        return AgentResponse(
+                            name=self._name,
+                            class_name=self.__class__.__name__,
+                            response=answer_content,
+                            trace_id=tracer.trace_id
+                        )
+                    elif function_name == "write_todos":
+                        self._add_history(
+                            history_type="result",
+                            message="Todos updated successfully."
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": "Todos updated successfully."
+                        })
+                        continue
 
                 # Parse function name to get server and tool names
                 server_name, tool_name = self._parse_function_call_name(function_name)
@@ -769,6 +904,8 @@ class FunctionCall(BaseAgent):
                     "content": f"Error: {error_msg}"
                 }
                 messages.append(tool_message)
+
+        return None
 
     def get_history(self) -> str:
         """
