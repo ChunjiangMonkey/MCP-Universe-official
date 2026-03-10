@@ -26,7 +26,9 @@ model_name_map = {
     "deepseek": "deepseek/deepseek-v3.2",
     "kimi": "moonshotai/kimi-k2.5",
     "tongyi":"alibaba/tongyi-deepresearch-30b-a3b",
-    "glm5":"z-ai/glm-5"
+    "glm5":"z-ai/glm-5",
+    "qwen3_5_4":"qwen/qwen3.5-4b-a3b-thinking-2507",
+
 }
 
 @dataclass

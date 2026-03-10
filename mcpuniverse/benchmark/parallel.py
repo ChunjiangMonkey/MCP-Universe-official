@@ -223,10 +223,10 @@ class FeedbackController:
     def __init__(
         self,
         window_size: int = 20,
-        max_cooldown: float = 300.0,
+        max_cooldown: float = 60.0,
         initial_concurrency: int = 10,
         min_concurrency: int = 1,
-        memory_threshold: float = 0.6,
+        memory_threshold: float = 0.8,
     ):
         self._window: deque[WorkerResult] = deque(maxlen=window_size)
         self._window_size = window_size
