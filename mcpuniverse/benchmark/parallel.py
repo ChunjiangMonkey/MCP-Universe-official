@@ -11,6 +11,9 @@ Usage:
     # Orchestrator mode — multiple configs pooled into one run
     python -m mcpuniverse.benchmark.parallel a.yaml b.yaml c.yaml --concurrency 20
 
+    # Orchestrator mode — sequential runs from settings file
+    python -m mcpuniverse.benchmark.parallel config.yaml --settings-file settings.yaml
+
     # Worker mode (called internally by orchestrator)
     python -m mcpuniverse.benchmark.parallel --worker config.yaml --output result.json --log-file trace.log
 """
@@ -21,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,7 +34,7 @@ import psutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -109,6 +113,17 @@ class WorkerResult:
     end_time: str = ""
 
 
+@dataclass
+class RunSetting:
+    """Single sequential benchmark setting."""
+    name: str
+    model_name: str
+    llm_type: Optional[str] = None
+    base_url: Optional[str] = None
+    concurrency: Optional[int] = None
+    use_custom_tools: Optional[bool] = None
+
+
 # ---------------------------------------------------------------------------
 # GitHub token loading
 # ---------------------------------------------------------------------------
@@ -132,6 +147,35 @@ def _load_github_tokens(csv_path: str) -> List[Tuple[str, str]]:
     if not accounts:
         raise ValueError(f"No valid GitHub accounts found in {csv_path}")
     return accounts
+
+
+def _cleanup_github_repos(github_tokens: Optional[str] = None) -> None:
+    """Best-effort cleanup of repos created during a benchmark run."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    script_path = os.path.join(repo_root, "cleanup_github_repos.sh")
+    cmd = ["bash", script_path]
+    if github_tokens:
+        cmd.append(github_tokens)
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        print(f"[cleanup] Completed GitHub repo cleanup using {os.path.basename(script_path)}")
+        if completed.stdout.strip():
+            print(completed.stdout.strip())
+    except FileNotFoundError:
+        print(f"[cleanup] Skipped: script not found at {script_path}")
+    except subprocess.CalledProcessError as exc:
+        print(f"[cleanup] Failed with exit code {exc.returncode}")
+        if exc.stdout.strip():
+            print(exc.stdout.strip())
+        if exc.stderr.strip():
+            print(exc.stderr.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +363,264 @@ def _parse_config_documents(config_path: str) -> List[dict]:
         return list(yaml.safe_load_all(f))
 
 
+def _resolve_config_path(config_path: str) -> str:
+    """Resolve a config path using benchmark default folder fallback."""
+    if os.path.exists(config_path):
+        return config_path
+    default_folder = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
+    candidate = os.path.join(default_folder, config_path)
+    if os.path.exists(candidate):
+        return candidate
+    raise ValueError(f"Cannot find config file: {config_path}")
+
+
+def _safe_name(name: str, fallback: str) -> str:
+    """Sanitize arbitrary names for filesystem usage."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    return cleaned or fallback
+
+
+def _task_output_relpath(task_path: str) -> str:
+    """Convert a benchmark task path to a stable output-relative file path."""
+    normalized = str(task_path).replace("\\", "/").lstrip("/")
+    if normalized.startswith("mcpuniverse/"):
+        normalized = normalized[len("mcpuniverse/"):]
+    if not normalized:
+        normalized = "unknown_task.json"
+    if not normalized.endswith(".json"):
+        normalized = f"{normalized}.json"
+    return normalized
+
+
+def _task_output_paths(output_dir: str, task_path: str, attempt: int = 1) -> Tuple[str, str]:
+    """Build output JSON and trace log paths for a task and attempt."""
+    rel_json = _task_output_relpath(task_path)
+    if attempt > 1:
+        stem, ext = os.path.splitext(rel_json)
+        rel_json = f"{stem}_r{attempt - 1}{ext}"
+
+    output_json = os.path.join(output_dir, rel_json)
+    trace_stem, _ = os.path.splitext(rel_json)
+    log_path = os.path.join(output_dir, f"{trace_stem}.trace.log")
+    return output_json, log_path
+
+
+def _coerce_bool(value: Any, key: str) -> bool:
+    """Parse bool/str bool values from settings YAML."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"`{key}` must be bool or bool-like string, got: {value!r}")
+
+
+def _load_run_settings(settings_path: str) -> List[RunSetting]:
+    """Load sequential run settings from YAML."""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+
+    if isinstance(payload, list):
+        raw_settings = payload
+    elif isinstance(payload, dict):
+        raw_settings = payload.get("settings", payload.get("runs", payload.get("experiments", [])))
+    else:
+        raise ValueError("Settings file must be a YAML list or object containing `settings`")
+
+    if not isinstance(raw_settings, list) or not raw_settings:
+        raise ValueError("Settings file must define at least one setting")
+
+    settings: List[RunSetting] = []
+    for idx, item in enumerate(raw_settings):
+        if not isinstance(item, dict):
+            raise ValueError(f"settings[{idx}] must be an object")
+        model_name = item.get("model_name")
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(f"settings[{idx}].model_name is required and must be a non-empty string")
+
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = f"run_{idx:02d}_{model_name}"
+
+        concurrency = item.get("concurrency")
+        if concurrency is not None:
+            try:
+                concurrency = int(concurrency)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].concurrency must be an integer") from exc
+            if concurrency < 1:
+                raise ValueError(f"settings[{idx}].concurrency must be >= 1")
+
+        llm_type = item.get("type", item.get("llm_type"))
+        if llm_type is not None:
+            if not isinstance(llm_type, str) or not llm_type.strip():
+                raise ValueError(f"settings[{idx}].type must be a non-empty string")
+            llm_type = llm_type.strip()
+
+        base_url = item.get("base_url", None)
+        if base_url is not None and not isinstance(base_url, str):
+            raise ValueError(f"settings[{idx}].base_url must be a string")
+
+        use_custom_tools = item.get("use_custom_tools")
+        if use_custom_tools is not None:
+            use_custom_tools = _coerce_bool(use_custom_tools, f"settings[{idx}].use_custom_tools")
+
+        settings.append(RunSetting(
+            name=name.strip(),
+            model_name=model_name.strip(),
+            llm_type=llm_type,
+            base_url=base_url,
+            concurrency=concurrency,
+            use_custom_tools=use_custom_tools,
+        ))
+
+    return settings
+
+
+def _write_overridden_config(
+    source_config_path: str,
+    output_config_path: str,
+    setting: RunSetting,
+) -> None:
+    """Write a temp config with model/type/base_url/use_custom_tools overrides."""
+    source_path = _resolve_config_path(source_config_path)
+    docs = _parse_config_documents(source_path)
+
+    llm_updates = 0
+    agent_updates = 0
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        kind = str(doc.get("kind", "")).lower()
+        spec = doc.setdefault("spec", {})
+        if not isinstance(spec, dict):
+            continue
+        config = spec.setdefault("config", {})
+        if not isinstance(config, dict):
+            continue
+
+        if kind == "llm":
+            if setting.llm_type is not None:
+                spec["type"] = setting.llm_type
+            config["model_name"] = setting.model_name
+            if setting.base_url is not None:
+                config["base_url"] = setting.base_url
+            llm_updates += 1
+
+        if kind == "agent" and setting.use_custom_tools is not None:
+            config["use_custom_tools"] = setting.use_custom_tools
+            agent_updates += 1
+
+    if llm_updates == 0:
+        raise ValueError(
+            f"No `kind: llm` document found in config {source_config_path}; cannot apply model_name override"
+        )
+    if setting.use_custom_tools is not None and agent_updates == 0:
+        print(
+            f"[warning] No `kind: agent` document found in {source_config_path}; "
+            "use_custom_tools override skipped."
+        )
+
+    os.makedirs(os.path.dirname(output_config_path), exist_ok=True)
+    with open(output_config_path, "w", encoding="utf-8") as f:
+        yaml.dump_all(docs, f, default_flow_style=False, allow_unicode=True)
+
+
+async def _run_settings_suite(
+    settings_file: str,
+    config_paths: List[str],
+    default_concurrency: int,
+    output_dir: Optional[str],
+    max_retries: int,
+    github_tokens: Optional[str],
+    min_concurrency: int,
+    memory_threshold: float,
+) -> None:
+    """Run multiple settings sequentially; each setting executes in parallel per task."""
+    settings = _load_run_settings(settings_file)
+
+    suite_base = output_dir or os.path.join(
+        "results",
+        f"settings_{os.path.splitext(os.path.basename(settings_file))[0]}",
+    )
+    suite_dir = f"{suite_base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(suite_dir, exist_ok=True)
+
+    temp_dir = tempfile.mkdtemp(prefix="mcpu_settings_")
+    summary_runs: List[Dict[str, Any]] = []
+    try:
+        for idx, setting in enumerate(settings):
+            setting_name = _safe_name(setting.name, f"setting_{idx:02d}")
+            setting_tmp_dir = os.path.join(temp_dir, f"{idx:02d}_{setting_name}")
+            os.makedirs(setting_tmp_dir, exist_ok=True)
+
+            materialized_configs: List[str] = []
+            for cfg_idx, cfg_path in enumerate(config_paths):
+                output_cfg = os.path.join(setting_tmp_dir, f"config_{cfg_idx:02d}.yaml")
+                _write_overridden_config(
+                    source_config_path=cfg_path,
+                    output_config_path=output_cfg,
+                    setting=setting,
+                )
+                materialized_configs.append(output_cfg)
+
+            run_concurrency = setting.concurrency or default_concurrency
+            run_output_dir = os.path.join(suite_dir, f"{idx:02d}_{setting_name}")
+            print(
+                f"\n=== Setting {idx + 1}/{len(settings)}: {setting.name} "
+                f"(type={setting.llm_type}, model={setting.model_name}, concurrency={run_concurrency}, "
+                f"use_custom_tools={setting.use_custom_tools}) ==="
+            )
+
+            runner = ParallelBenchmarkRunner(
+                config=materialized_configs,
+                concurrency=run_concurrency,
+                output_dir=run_output_dir,
+                max_retries=max_retries,
+                github_tokens=github_tokens,
+                min_concurrency=min_concurrency,
+                memory_threshold=memory_threshold,
+            )
+            try:
+                await runner.run()
+            finally:
+                _cleanup_github_repos(github_tokens)
+
+            merged_path = os.path.join(runner._output_dir, "merged_results.json")
+            merged_summary: Dict[str, Any] = {}
+            if os.path.isfile(merged_path):
+                with open(merged_path, "r", encoding="utf-8") as f:
+                    merged_summary = (json.load(f) or {}).get("summary", {})
+
+            summary_runs.append({
+                "name": setting.name,
+                "type": setting.llm_type,
+                "model_name": setting.model_name,
+                "base_url": setting.base_url,
+                "use_custom_tools": setting.use_custom_tools,
+                "concurrency": run_concurrency,
+                "output_dir": runner._output_dir,
+                "merged_results": merged_path,
+                "summary": merged_summary,
+            })
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    suite_summary = {
+        "settings_file": settings_file,
+        "base_configs": config_paths,
+        "generated_at": datetime.now().isoformat(),
+        "runs": summary_runs,
+    }
+    suite_summary_path = os.path.join(suite_dir, "suite_summary.json")
+    with open(suite_summary_path, "w", encoding="utf-8") as f:
+        json.dump(suite_summary, f, indent=2, ensure_ascii=False)
+    print(f"\nSuite summary written to {suite_summary_path}")
+
+
 def _split_into_single_task_yamls(
     config_path: str,
     temp_dir: str,
@@ -483,9 +785,8 @@ class ParallelBenchmarkRunner:
 
             # First pass
             coros = []
-            for idx, (task_path, temp_yaml) in enumerate(task_items):
-                out_json = os.path.join(self._output_dir, f"result_{idx:04d}.json")
-                log_path = os.path.join(self._output_dir, f"trace_{idx:04d}.log")
+            for task_path, temp_yaml in task_items:
+                out_json, log_path = _task_output_paths(self._output_dir, task_path, attempt=1)
                 coros.append(
                     self._launch_worker(task_path, temp_yaml, out_json, log_path, semaphore, attempt=1)
                 )
@@ -512,12 +813,8 @@ class ParallelBenchmarkRunner:
                     if not matching:
                         continue
                     task_path, temp_yaml = matching[0]
-                    idx_str = os.path.basename(temp_yaml).replace("task_", "").replace(".yaml", "")
-                    out_json = os.path.join(
-                        self._output_dir, f"result_{idx_str}_r{retry_round}.json"
-                    )
-                    log_path = os.path.join(
-                        self._output_dir, f"trace_{idx_str}_r{retry_round}.log"
+                    out_json, log_path = _task_output_paths(
+                        self._output_dir, task_path, attempt=retry_round + 1
                     )
                     retry_coros.append(
                         self._launch_worker(
@@ -566,13 +863,16 @@ class ParallelBenchmarkRunner:
         attempt: int = 1,
     ) -> WorkerResult:
         """Launch a single worker subprocess under semaphore control."""
+        delay = await self._feedback.wait_before_launch()
+        if delay > 0:
+            print(f"  [feedback] Delayed {delay:.1f}s before launching: {task_path}")
+
         async with semaphore:
-            delay = await self._feedback.wait_before_launch()
-            if delay > 0:
-                print(f"  [feedback] Delayed {delay:.1f}s before launching: {task_path}")
 
             print(f"  [{attempt}] Starting: {task_path}")
             start = time.monotonic()
+            os.makedirs(os.path.dirname(output_json), exist_ok=True)
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
             worker_env = None
             if hasattr(self, "_task_account_map") and task_path in self._task_account_map:
@@ -903,6 +1203,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--github-tokens", default=None,
         help="(orchestrator) CSV file with GitHub accounts (username,token) for round-robin distribution",
     )
+    parser.add_argument(
+        "--settings-file",
+        default=None,
+        help=(
+            "(orchestrator) YAML file defining sequential settings. "
+            "Each setting can override type, model_name, base_url, concurrency, use_custom_tools."
+        ),
+    )
     return parser
 
 
@@ -917,6 +1225,19 @@ def main() -> None:
         if not args.log_file:
             parser.error("--log-file is required in worker mode")
         asyncio.run(_run_worker(args.worker, args.output, args.log_file))
+    elif args.settings_file:
+        if not args.config:
+            parser.error("Provide at least one config path when using --settings-file")
+        asyncio.run(_run_settings_suite(
+            settings_file=args.settings_file,
+            config_paths=args.config,
+            default_concurrency=args.concurrency,
+            output_dir=args.output_dir,
+            max_retries=args.max_retries,
+            github_tokens=args.github_tokens,
+            min_concurrency=args.min_concurrency,
+            memory_threshold=args.memory_threshold,
+        ))
     elif args.config:
         # Orchestrator mode — single config or multiple configs pooled
         runner = ParallelBenchmarkRunner(
@@ -928,7 +1249,10 @@ def main() -> None:
             min_concurrency=args.min_concurrency,
             memory_threshold=args.memory_threshold,
         )
-        asyncio.run(runner.run())
+        try:
+            asyncio.run(runner.run())
+        finally:
+            _cleanup_github_repos(args.github_tokens)
     else:
         parser.error("Provide config path(s) or use --worker mode")
 

@@ -14,9 +14,16 @@ from mcpuniverse.benchmark.parallel import (
     AdaptiveSemaphore,
     ErrorCategory,
     FeedbackController,
+    RunSetting,
     WorkerResult,
+    _cleanup_github_repos,
+    _load_run_settings,
     _parse_config_documents,
+    _run_settings_suite,
     _split_into_single_task_yamls,
+    _task_output_paths,
+    _task_output_relpath,
+    _write_overridden_config,
     classify_error,
 )
 
@@ -296,6 +303,171 @@ class TestYamlSplitting(unittest.TestCase):
             self.assertEqual(parsed[1]["kind"], "benchmark")
         finally:
             os.unlink(config_path)
+
+
+class TestSettingsOverrides(unittest.TestCase):
+    """Tests for settings parsing and YAML override behavior."""
+
+    def test_load_run_settings_supports_type_field(self):
+        payload = {
+            "settings": [
+                {
+                    "name": "s1",
+                    "type": "openai",
+                    "model_name": "qwen",
+                    "concurrency": 2,
+                    "use_custom_tools": "true",
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        ) as f:
+            yaml.safe_dump(payload, f)
+            settings_path = f.name
+
+        try:
+            settings = _load_run_settings(settings_path)
+            self.assertEqual(len(settings), 1)
+            self.assertEqual(settings[0].llm_type, "openai")
+            self.assertEqual(settings[0].model_name, "qwen")
+            self.assertEqual(settings[0].concurrency, 2)
+            self.assertTrue(settings[0].use_custom_tools)
+        finally:
+            os.unlink(settings_path)
+
+    def test_write_overridden_config_updates_llm_type(self):
+        docs = [
+            {
+                "kind": "llm",
+                "spec": {
+                    "name": "llm-1",
+                    "type": "openrouter",
+                    "config": {"model_name": "old-model"},
+                },
+            },
+            {
+                "kind": "agent",
+                "spec": {
+                    "name": "agent-1",
+                    "type": "function-call",
+                    "config": {"llm": "llm-1", "use_custom_tools": False},
+                },
+            },
+            {"kind": "benchmark", "spec": {"description": "x", "agent": "agent-1", "tasks": ["a.json"]}},
+        ]
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        ) as src:
+            yaml.dump_all(docs, src, default_flow_style=False)
+            source_path = src.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        ) as dst:
+            output_path = dst.name
+
+        try:
+            setting = RunSetting(
+                name="test",
+                llm_type="openai",
+                model_name="new-model",
+                base_url="http://127.0.0.1:8000/v1",
+                use_custom_tools=True,
+            )
+            _write_overridden_config(source_path, output_path, setting)
+            overridden = _parse_config_documents(output_path)
+
+            llm_doc = next(d for d in overridden if d.get("kind", "").lower() == "llm")
+            agent_doc = next(d for d in overridden if d.get("kind", "").lower() == "agent")
+            self.assertEqual(llm_doc["spec"]["type"], "openai")
+            self.assertEqual(llm_doc["spec"]["config"]["model_name"], "new-model")
+            self.assertEqual(llm_doc["spec"]["config"]["base_url"], "http://127.0.0.1:8000/v1")
+            self.assertTrue(agent_doc["spec"]["config"]["use_custom_tools"])
+        finally:
+            os.unlink(source_path)
+            os.unlink(output_path)
+
+
+class TestTaskOutputPaths(unittest.TestCase):
+    """Tests for task-based output file naming."""
+
+    def test_task_output_relpath_strips_mcpuniverse_prefix(self):
+        relpath = _task_output_relpath("mcpuniverse/browser_automation/playwright_paper_task_0001.json")
+        self.assertEqual(relpath, "browser_automation/playwright_paper_task_0001.json")
+
+    def test_task_output_paths_retry_suffix(self):
+        output_json, log_path = _task_output_paths(
+            "/tmp/results", "mcpuniverse/web_search/info_search_task_0001.json", attempt=2
+        )
+        self.assertEqual(output_json, "/tmp/results/web_search/info_search_task_0001_r1.json")
+        self.assertEqual(log_path, "/tmp/results/web_search/info_search_task_0001_r1.trace.log")
+
+
+class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):
+    """Tests for post-run GitHub cleanup hooks."""
+
+    @patch("mcpuniverse.benchmark.parallel.subprocess.run")
+    def test_cleanup_github_repos_uses_custom_token_file(self, mock_run):
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
+        _cleanup_github_repos("tokens.csv")
+        cmd = mock_run.call_args.args[0]
+        self.assertEqual(os.path.basename(cmd[-2]), "cleanup_github_repos.sh")
+        self.assertEqual(cmd[-1], "tokens.csv")
+
+    async def test_run_settings_suite_cleans_up_after_each_setting(self):
+        docs = [
+            {
+                "kind": "llm",
+                "spec": {"name": "llm-1", "type": "openai", "config": {"model_name": "base"}},
+            },
+            {
+                "kind": "agent",
+                "spec": {"name": "agent-1", "type": "function-call", "config": {"llm": "llm-1"}},
+            },
+            {
+                "kind": "benchmark",
+                "spec": {"description": "bench", "agent": "agent-1", "tasks": ["task_a.json"]},
+            },
+        ]
+        settings_payload = {
+            "settings": [
+                {"name": "s1", "model_name": "m1"},
+                {"name": "s2", "model_name": "m2"},
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "config.yaml")
+            settings_path = os.path.join(tmpdir, "settings.yaml")
+            output_dir = os.path.join(tmpdir, "results")
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump_all(docs, f, default_flow_style=False)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(settings_payload, f)
+
+            class FakeRunner:
+                def __init__(self, config, concurrency, output_dir, max_retries, github_tokens, min_concurrency, memory_threshold):
+                    self._output_dir = output_dir
+
+                async def run(self):
+                    os.makedirs(self._output_dir, exist_ok=True)
+
+            with patch("mcpuniverse.benchmark.parallel.ParallelBenchmarkRunner", FakeRunner):
+                with patch("mcpuniverse.benchmark.parallel._cleanup_github_repos") as mock_cleanup:
+                    await _run_settings_suite(
+                        settings_file=settings_path,
+                        config_paths=[config_path],
+                        default_concurrency=1,
+                        output_dir=output_dir,
+                        max_retries=0,
+                        github_tokens="github_token.csv",
+                        min_concurrency=1,
+                        memory_threshold=0.6,
+                    )
+
+            self.assertEqual(mock_cleanup.call_count, 2)
+            mock_cleanup.assert_any_call("github_token.csv")
 
 
 class TestAdaptiveSemaphore(unittest.IsolatedAsyncioTestCase):

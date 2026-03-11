@@ -210,3 +210,7 @@ mcpuniverse/benchmark/configs/deepresearch/gaia_val_text_only
 mcpuniverse/benchmark/configs/deepresearch/hle_text_only
 results/
 并行方案.md
+custom_tools/train.jsonl
+custom_tools/system_prompt.txt
+custom_tools/server.py
+custom_tools/observed_tool_schema.jsonl

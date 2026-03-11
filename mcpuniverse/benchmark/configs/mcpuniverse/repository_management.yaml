@@ -3,7 +3,7 @@ spec:
   name: llm-1
   type: openai
   config:
-    model_name: qwen8
+    model_name: qwen_v8
 
 ---
 kind: agent

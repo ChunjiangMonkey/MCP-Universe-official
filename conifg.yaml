@@ -1,0 +1,19 @@
+settings:
+  - name: qwen35_4b_baseline_no_use_custom_tools
+    type: openai
+    model_name: qwen35
+    base_url: http://localhost:8005/v1
+    concurrency: 30
+    use_custom_tools: false
+
+  - name: qwen_v8_use_custom_tools
+    type: openai
+    model_name: qwen_v8
+    base_url: http://localhost:8000/v1
+    concurrency: 30
+    use_custom_tools: true
+
+
+
+
+
