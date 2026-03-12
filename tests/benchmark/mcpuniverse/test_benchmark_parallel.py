@@ -5,6 +5,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -243,12 +244,12 @@ class TestYamlSplitting(unittest.TestCase):
             self.assertEqual(len(result), 3)
 
             # Verify each split file has exactly one task
-            for task_path, yaml_path in result:
-                split_docs = _parse_config_documents(yaml_path)
+            for task_item in result:
+                split_docs = _parse_config_documents(task_item.temp_yaml)
                 bench_docs = [d for d in split_docs if d.get("kind", "").lower() == "benchmark"]
                 self.assertEqual(len(bench_docs), 1)
                 self.assertEqual(len(bench_docs[0]["spec"]["tasks"]), 1)
-                self.assertEqual(bench_docs[0]["spec"]["tasks"][0], task_path)
+                self.assertEqual(bench_docs[0]["spec"]["tasks"][0], task_item.task_path)
 
                 # Non-benchmark docs preserved
                 non_bench = [d for d in split_docs if d.get("kind", "").lower() != "benchmark"]
@@ -278,12 +279,33 @@ class TestYamlSplitting(unittest.TestCase):
         try:
             result = _split_into_single_task_yamls(config_path, temp_dir)
             self.assertEqual(len(result), 3)
-            task_paths = [tp for tp, _ in result]
+            task_paths = [item.task_path for item in result]
             self.assertEqual(task_paths, ["t1.json", "t2.json", "t3.json"])
         finally:
             os.unlink(config_path)
             import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_split_infers_category_from_non_multi_server_tasks(self):
+        docs = [
+            {"kind": "llm", "spec": {"name": "llm-1", "type": "test", "config": {}}},
+            {"kind": "benchmark", "spec": {
+                "description": "bench",
+                "agent": "a",
+                "tasks": [
+                    "mcpuniverse/web_search/info_search_task_0001.json",
+                    "mcpuniverse/multi_server/multi-server_task_google_search_notion_0001.json",
+                ],
+            }},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "config_00.yaml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump_all(docs, f, default_flow_style=False)
+
+            result = _split_into_single_task_yamls(config_path, os.path.join(tmpdir, "split"))
+
+        self.assertEqual([item.category for item in result], ["web_search", "web_search"])
 
     def test_parse_config_documents(self):
         docs = [
@@ -395,12 +417,91 @@ class TestTaskOutputPaths(unittest.TestCase):
         relpath = _task_output_relpath("mcpuniverse/browser_automation/playwright_paper_task_0001.json")
         self.assertEqual(relpath, "browser_automation/playwright_paper_task_0001.json")
 
+    def test_task_output_relpath_uses_category_for_multi_server_task(self):
+        relpath = _task_output_relpath(
+            "mcpuniverse/multi_server/multi-server_task_google_search_notion_0001.json",
+            category="web_search",
+        )
+        self.assertEqual(relpath, "web_search/multi-server_task_google_search_notion_0001.json")
+
     def test_task_output_paths_retry_suffix(self):
         output_json, log_path = _task_output_paths(
             "/tmp/results", "mcpuniverse/web_search/info_search_task_0001.json", attempt=2
         )
         self.assertEqual(output_json, "/tmp/results/web_search/info_search_task_0001_r1.json")
         self.assertEqual(log_path, "/tmp/results/web_search/info_search_task_0001_r1.trace.log")
+
+    def test_task_output_paths_retry_suffix_with_category(self):
+        output_json, log_path = _task_output_paths(
+            "/tmp/results",
+            "mcpuniverse/multi_server/multi-server_task_playwright_notion_0001.json",
+            attempt=2,
+            category="browser_automation",
+        )
+        self.assertEqual(
+            output_json,
+            "/tmp/results/browser_automation/multi-server_task_playwright_notion_0001_r1.json",
+        )
+        self.assertEqual(
+            log_path,
+            "/tmp/results/browser_automation/multi-server_task_playwright_notion_0001_r1.trace.log",
+        )
+
+
+class TestSummaryByCategory(unittest.TestCase):
+    """Tests for category-level pass-rate summaries."""
+
+    def test_build_summary_includes_category_stats(self):
+        merged = [
+            SimpleNamespace(
+                task_results={
+                    "mcpuniverse/browser_automation/playwright_paper_task_0001.json": {
+                        "evaluation_results": [{"passed": True}, {"passed": False}],
+                    },
+                    "mcpuniverse/multi_server/multi-server_task_playwright_notion_0001.json": {
+                        "evaluation_results": [{"passed": True}],
+                    },
+                    "mcpuniverse/web_search/info_search_task_0001.json": {
+                        "evaluation_results": [],
+                    },
+                }
+            )
+        ]
+        worker_results = [
+            WorkerResult(
+                task_path="mcpuniverse/browser_automation/playwright_paper_task_0001.json",
+                success=True,
+                category="browser_automation",
+            ),
+            WorkerResult(
+                task_path="mcpuniverse/multi_server/multi-server_task_playwright_notion_0001.json",
+                success=True,
+                category="browser_automation",
+            ),
+            WorkerResult(
+                task_path="mcpuniverse/web_search/info_search_task_0001.json",
+                success=False,
+                category="web_search",
+            ),
+        ]
+
+        from mcpuniverse.benchmark.parallel import ParallelBenchmarkRunner
+
+        summary = ParallelBenchmarkRunner._build_summary(merged, worker_results)
+
+        self.assertEqual(summary["eval_total"], 3)
+        self.assertEqual(summary["task_total"], 3)
+        self.assertIn("browser_automation", summary["categories"])
+        self.assertIn("web_search", summary["categories"])
+        self.assertEqual(summary["categories"]["browser_automation"]["eval_total"], 3)
+        self.assertEqual(summary["categories"]["browser_automation"]["eval_passed"], 2)
+        self.assertEqual(summary["categories"]["browser_automation"]["task_total"], 2)
+        self.assertEqual(summary["categories"]["browser_automation"]["task_passed"], 1)
+        self.assertAlmostEqual(summary["categories"]["browser_automation"]["eval_pass_rate"], 0.6667)
+        self.assertAlmostEqual(summary["categories"]["browser_automation"]["task_pass_rate"], 0.5)
+        self.assertEqual(summary["categories"]["web_search"]["eval_total"], 0)
+        self.assertEqual(summary["categories"]["web_search"]["task_total"], 1)
+        self.assertEqual(summary["categories"]["web_search"]["task_failed"], 1)
 
 
 class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):

@@ -22,6 +22,7 @@ import asyncio
 import copy
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -103,6 +104,8 @@ class WorkerResult:
     task_path: str
     success: bool
     evaluation_results: Optional[List[Dict]] = None
+    category: str = ""
+    temp_yaml: str = ""
     trace_id: str = ""
     error_category: ErrorCategory = ErrorCategory.UNKNOWN
     stderr: str = ""
@@ -122,6 +125,16 @@ class RunSetting:
     base_url: Optional[str] = None
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class TaskItem:
+    """Single benchmark task prepared for pooled execution."""
+
+    task_path: str
+    temp_yaml: str
+    category: str
+    source_config: str
 
 
 # ---------------------------------------------------------------------------
@@ -380,21 +393,62 @@ def _safe_name(name: str, fallback: str) -> str:
     return cleaned or fallback
 
 
-def _task_output_relpath(task_path: str) -> str:
+def _task_namespace(task_path: str) -> str:
+    """Extract the top-level task namespace from a benchmark task path."""
+    normalized = str(task_path).replace("\\", "/").lstrip("/")
+    if normalized.startswith("mcpuniverse/"):
+        normalized = normalized[len("mcpuniverse/"):]
+    parts = [part for part in normalized.split("/") if part]
+    return parts[0] if parts else ""
+
+
+def _config_category(config_path: str, docs: Optional[List[dict]] = None) -> str:
+    """Infer the logical benchmark category for a config file."""
+    if docs is None:
+        docs = _parse_config_documents(config_path)
+
+    namespaces = set()
+    for doc in docs:
+        if doc.get("kind", "").lower() != "benchmark":
+            continue
+        tasks = doc.get("spec", {}).get("tasks", [])
+        for task_path in tasks:
+            namespace = _task_namespace(task_path)
+            if namespace and namespace != "multi_server":
+                namespaces.add(namespace)
+
+    if len(namespaces) == 1:
+        return namespaces.pop()
+
+    config_name = os.path.splitext(os.path.basename(config_path))[0]
+    return _safe_name(config_name, "uncategorized")
+
+
+def _task_output_relpath(task_path: str, category: Optional[str] = None) -> str:
     """Convert a benchmark task path to a stable output-relative file path."""
     normalized = str(task_path).replace("\\", "/").lstrip("/")
     if normalized.startswith("mcpuniverse/"):
         normalized = normalized[len("mcpuniverse/"):]
     if not normalized:
         normalized = "unknown_task.json"
+    if category:
+        filename = os.path.basename(normalized) or "unknown_task.json"
+        if not filename.endswith(".json"):
+            filename = f"{filename}.json"
+        return os.path.join(_safe_name(category, "uncategorized"), filename)
     if not normalized.endswith(".json"):
         normalized = f"{normalized}.json"
     return normalized
 
 
-def _task_output_paths(output_dir: str, task_path: str, attempt: int = 1) -> Tuple[str, str]:
+def _task_output_paths(
+    output_dir: str,
+    task_path: str,
+    attempt: int = 1,
+    category: Optional[str] = None,
+) -> Tuple[str, str]:
     """Build output JSON and trace log paths for a task and attempt."""
-    rel_json = _task_output_relpath(task_path)
+    rel_json = _task_output_relpath(task_path, category=category)
     if attempt > 1:
         stem, ext = os.path.splitext(rel_json)
         rel_json = f"{stem}_r{attempt - 1}{ext}"
@@ -624,12 +678,13 @@ async def _run_settings_suite(
 def _split_into_single_task_yamls(
     config_path: str,
     temp_dir: str,
-) -> List[Tuple[str, str]]:
+) -> List[TaskItem]:
     """Split a multi-task benchmark YAML into per-task YAML files.
 
-    Returns a list of ``(task_path, temp_yaml_path)`` tuples.
+    Returns a list of task items carrying their logical output category.
     """
     docs = _parse_config_documents(config_path)
+    category = _config_category(config_path, docs=docs)
 
     non_benchmark_docs: List[dict] = []
     benchmark_docs: List[dict] = []
@@ -640,7 +695,7 @@ def _split_into_single_task_yamls(
             non_benchmark_docs.append(doc)
 
     os.makedirs(temp_dir, exist_ok=True)
-    result: List[Tuple[str, str]] = []
+    result: List[TaskItem] = []
     task_index = 0
 
     for bench_doc in benchmark_docs:
@@ -656,7 +711,12 @@ def _split_into_single_task_yamls(
                     default_flow_style=False,
                     allow_unicode=True,
                 )
-            result.append((task_path, temp_yaml))
+            result.append(TaskItem(
+                task_path=task_path,
+                temp_yaml=temp_yaml,
+                category=category,
+                source_config=config_path,
+            ))
             task_index += 1
 
     return result
@@ -764,31 +824,37 @@ class ParallelBenchmarkRunner:
 
         temp_dir = tempfile.mkdtemp(prefix="mcpu_parallel_")
         try:
-            task_items: List[Tuple[str, str]] = []
+            task_items: List[TaskItem] = []
             for cfg_idx, cfg_path in enumerate(self._configs):
                 sub_dir = os.path.join(temp_dir, f"config_{cfg_idx}")
                 task_items.extend(_split_into_single_task_yamls(cfg_path, sub_dir))
             if not task_items:
                 print("No tasks found in config(s).")
                 return []
+            random.shuffle(task_items)
 
             # Round-robin assign GitHub accounts to tasks
             self._task_account_map: Dict[str, Tuple[str, str]] = {}
             if self._github_accounts:
-                for idx, (task_path, _) in enumerate(task_items):
+                for idx, task_item in enumerate(task_items):
                     account = self._github_accounts[idx % len(self._github_accounts)]
-                    self._task_account_map[task_path] = account
-                    print(f"  [github] {task_path} -> {account[0]}")
+                    self._task_account_map[task_item.temp_yaml] = account
+                    print(f"  [github] {task_item.task_path} -> {account[0]}")
 
             os.makedirs(self._output_dir, exist_ok=True)
             semaphore = self._feedback.semaphore
 
             # First pass
             coros = []
-            for task_path, temp_yaml in task_items:
-                out_json, log_path = _task_output_paths(self._output_dir, task_path, attempt=1)
+            for task_item in task_items:
+                out_json, log_path = _task_output_paths(
+                    self._output_dir,
+                    task_item.task_path,
+                    attempt=1,
+                    category=task_item.category,
+                )
                 coros.append(
-                    self._launch_worker(task_path, temp_yaml, out_json, log_path, semaphore, attempt=1)
+                    self._launch_worker(task_item, out_json, log_path, semaphore, attempt=1)
                 )
 
             worker_results: List[WorkerResult] = await asyncio.gather(*coros)
@@ -806,19 +872,25 @@ class ParallelBenchmarkRunner:
                 # Rebuild temp yamls for failed tasks
                 retry_coros = []
                 for wr in failed:
-                    # Find the original temp yaml for this task
-                    matching = [
-                        (tp, ty) for tp, ty in task_items if tp == wr.task_path
-                    ]
-                    if not matching:
+                    if not wr.temp_yaml:
                         continue
-                    task_path, temp_yaml = matching[0]
                     out_json, log_path = _task_output_paths(
-                        self._output_dir, task_path, attempt=retry_round + 1
+                        self._output_dir,
+                        wr.task_path,
+                        attempt=retry_round + 1,
+                        category=wr.category,
                     )
                     retry_coros.append(
                         self._launch_worker(
-                            task_path, temp_yaml, out_json, log_path, semaphore,
+                            TaskItem(
+                                task_path=wr.task_path,
+                                temp_yaml=wr.temp_yaml,
+                                category=wr.category or "uncategorized",
+                                source_config="",
+                            ),
+                            out_json,
+                            log_path,
+                            semaphore,
                             attempt=retry_round + 1,
                         )
                     )
@@ -855,8 +927,7 @@ class ParallelBenchmarkRunner:
 
     async def _launch_worker(
         self,
-        task_path: str,
-        temp_yaml: str,
+        task_item: TaskItem,
         output_json: str,
         log_path: str,
         semaphore: AdaptiveSemaphore,
@@ -865,25 +936,25 @@ class ParallelBenchmarkRunner:
         """Launch a single worker subprocess under semaphore control."""
         delay = await self._feedback.wait_before_launch()
         if delay > 0:
-            print(f"  [feedback] Delayed {delay:.1f}s before launching: {task_path}")
+            print(f"  [feedback] Delayed {delay:.1f}s before launching: {task_item.task_path}")
 
         async with semaphore:
 
-            print(f"  [{attempt}] Starting: {task_path}")
+            print(f"  [{attempt}] Starting: {task_item.task_path}")
             start = time.monotonic()
             os.makedirs(os.path.dirname(output_json), exist_ok=True)
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
             worker_env = None
-            if hasattr(self, "_task_account_map") and task_path in self._task_account_map:
-                username, token = self._task_account_map[task_path]
+            if hasattr(self, "_task_account_map") and task_item.temp_yaml in self._task_account_map:
+                username, token = self._task_account_map[task_item.temp_yaml]
                 worker_env = {**os.environ,
                               "GITHUB_PERSONAL_ACCESS_TOKEN": token,
                               "GITHUB_PERSONAL_ACCOUNT_NAME": username}
 
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "mcpuniverse.benchmark.parallel",
-                "--worker", temp_yaml,
+                "--worker", task_item.temp_yaml,
                 "--output", output_json,
                 "--log-file", log_path,
                 stdout=asyncio.subprocess.PIPE,
@@ -901,7 +972,9 @@ class ParallelBenchmarkRunner:
                     if "error" in data:
                         error_cat = classify_error(data["error"] + stderr_text)
                         wr = WorkerResult(
-                            task_path=task_path, success=False,
+                            task_path=task_item.task_path, success=False,
+                            category=task_item.category,
+                            temp_yaml=task_item.temp_yaml,
                             error_category=error_cat, stderr=stderr_text,
                             return_code=proc.returncode, duration_seconds=duration,
                             attempt=attempt,
@@ -910,8 +983,10 @@ class ParallelBenchmarkRunner:
                         )
                     else:
                         wr = WorkerResult(
-                            task_path=task_path, success=True,
+                            task_path=task_item.task_path, success=True,
                             evaluation_results=data.get("evaluation_results", []),
+                            category=task_item.category,
+                            temp_yaml=task_item.temp_yaml,
                             trace_id=data.get("trace_id", ""),
                             return_code=0, duration_seconds=duration,
                             attempt=attempt,
@@ -920,7 +995,9 @@ class ParallelBenchmarkRunner:
                         )
                 except (json.JSONDecodeError, KeyError) as exc:
                     wr = WorkerResult(
-                        task_path=task_path, success=False,
+                        task_path=task_item.task_path, success=False,
+                        category=task_item.category,
+                        temp_yaml=task_item.temp_yaml,
                         error_category=ErrorCategory.UNKNOWN,
                         stderr=f"JSON parse error: {exc}\n{stderr_text}",
                         return_code=proc.returncode, duration_seconds=duration,
@@ -929,14 +1006,16 @@ class ParallelBenchmarkRunner:
             else:
                 error_cat = classify_error(stderr_text)
                 wr = WorkerResult(
-                    task_path=task_path, success=False,
+                    task_path=task_item.task_path, success=False,
+                    category=task_item.category,
+                    temp_yaml=task_item.temp_yaml,
                     error_category=error_cat, stderr=stderr_text,
                     return_code=proc.returncode or 1, duration_seconds=duration,
                     attempt=attempt,
                 )
 
             status = "\033[32mOK\033[0m" if wr.success else f"\033[31mFAIL ({wr.error_category.name})\033[0m"
-            print(f"  [{attempt}] Finished: {task_path} — {status} ({duration:.1f}s)")
+            print(f"  [{attempt}] Finished: {task_item.task_path} — {status} ({duration:.1f}s)")
 
             await self._feedback.record(wr)
             return wr
@@ -1071,20 +1150,42 @@ class ParallelBenchmarkRunner:
         merged: List[BenchmarkResult],
         worker_results: List[WorkerResult],
     ) -> Dict:
-        """Build a summary dict with per-task and overall pass rates."""
+        """Build a summary dict with per-task, per-category and overall pass rates."""
         task_summaries: List[Dict] = []
+        category_summaries: Dict[str, Dict[str, Union[int, float, str]]] = {}
         total_evals = 0
         total_evals_passed = 0
         total_tasks = 0
         total_tasks_passed = 0
+        task_categories = {
+            wr.task_path: (wr.category or "uncategorized")
+            for wr in worker_results
+        }
 
         for br in merged:
             for task_path, task_data in br.task_results.items():
                 eval_results = task_data.get("evaluation_results", [])
                 total_tasks += 1
+                category = task_categories.get(task_path, "uncategorized")
+                category_summary = category_summaries.setdefault(
+                    category,
+                    {
+                        "category": category,
+                        "eval_total": 0,
+                        "eval_passed": 0,
+                        "eval_failed": 0,
+                        "eval_pass_rate": 0.0,
+                        "task_total": 0,
+                        "task_passed": 0,
+                        "task_failed": 0,
+                        "task_pass_rate": 0.0,
+                    },
+                )
+                category_summary["task_total"] += 1
 
                 if not eval_results:
                     task_summaries.append({
+                        "category": category,
                         "task": task_path,
                         "evals_total": 0,
                         "evals_passed": 0,
@@ -1105,14 +1206,42 @@ class ParallelBenchmarkRunner:
                 total_evals_passed += n_passed
                 if task_passed:
                     total_tasks_passed += 1
+                    category_summary["task_passed"] += 1
 
                 task_summaries.append({
+                    "category": category,
                     "task": task_path,
                     "evals_total": n_total,
                     "evals_passed": n_passed,
                     "evals_failed": n_failed,
                     "task_passed": task_passed,
                 })
+                category_summary["eval_total"] += n_total
+                category_summary["eval_passed"] += n_passed
+
+        for category_summary in category_summaries.values():
+            category_summary["eval_failed"] = (
+                category_summary["eval_total"] - category_summary["eval_passed"]
+            )
+            category_summary["task_failed"] = (
+                category_summary["task_total"] - category_summary["task_passed"]
+            )
+            category_summary["eval_pass_rate"] = round(
+                (
+                    category_summary["eval_passed"] / category_summary["eval_total"]
+                    if category_summary["eval_total"] > 0
+                    else 0.0
+                ),
+                4,
+            )
+            category_summary["task_pass_rate"] = round(
+                (
+                    category_summary["task_passed"] / category_summary["task_total"]
+                    if category_summary["task_total"] > 0
+                    else 0.0
+                ),
+                4,
+            )
 
         eval_pass_rate = total_evals_passed / total_evals if total_evals > 0 else 0.0
         task_pass_rate = total_tasks_passed / total_tasks if total_tasks > 0 else 0.0
@@ -1154,6 +1283,10 @@ class ParallelBenchmarkRunner:
             "task_total": total_tasks,
             "task_passed": total_tasks_passed,
             "task_failed": total_tasks - total_tasks_passed,
+            "categories": {
+                name: category_summaries[name]
+                for name in sorted(category_summaries)
+            },
             "tasks": task_summaries,
         }
 
