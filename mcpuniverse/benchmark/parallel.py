@@ -125,6 +125,7 @@ class RunSetting:
     base_url: Optional[str] = None
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
+    github_tokens: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -472,10 +473,23 @@ def _coerce_bool(value: Any, key: str) -> bool:
     raise ValueError(f"`{key}` must be bool or bool-like string, got: {value!r}")
 
 
+def _load_settings_payload(settings_path: str) -> Union[Dict[str, Any], List[Any]]:
+    """Load the raw YAML payload for a settings file."""
+    with open(settings_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _resolve_settings_path(path_value: str, settings_path: str) -> str:
+    """Resolve a settings-relative file path to an absolute path."""
+    if os.path.isabs(path_value):
+        return path_value
+    settings_dir = os.path.dirname(os.path.abspath(settings_path))
+    return os.path.normpath(os.path.join(settings_dir, path_value))
+
+
 def _load_run_settings(settings_path: str) -> List[RunSetting]:
     """Load sequential run settings from YAML."""
-    with open(settings_path, "r", encoding="utf-8") as f:
-        payload = yaml.safe_load(f) or {}
+    payload = _load_settings_payload(settings_path)
 
     if isinstance(payload, list):
         raw_settings = payload
@@ -522,6 +536,17 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
         if use_custom_tools is not None:
             use_custom_tools = _coerce_bool(use_custom_tools, f"settings[{idx}].use_custom_tools")
 
+        github_tokens = item.get(
+            "github_tokens",
+            item.get("github_token_file", item.get("github_token_path")),
+        )
+        if github_tokens is not None:
+            if not isinstance(github_tokens, str) or not github_tokens.strip():
+                raise ValueError(
+                    f"settings[{idx}].github_tokens must be a non-empty string"
+                )
+            github_tokens = _resolve_settings_path(github_tokens.strip(), settings_path)
+
         settings.append(RunSetting(
             name=name.strip(),
             model_name=model_name.strip(),
@@ -529,6 +554,7 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             base_url=base_url,
             concurrency=concurrency,
             use_custom_tools=use_custom_tools,
+            github_tokens=github_tokens,
         ))
 
     return settings
@@ -622,11 +648,12 @@ async def _run_settings_suite(
                 materialized_configs.append(output_cfg)
 
             run_concurrency = setting.concurrency or default_concurrency
+            run_github_tokens = github_tokens or setting.github_tokens
             run_output_dir = os.path.join(suite_dir, f"{idx:02d}_{setting_name}")
             print(
                 f"\n=== Setting {idx + 1}/{len(settings)}: {setting.name} "
                 f"(type={setting.llm_type}, model={setting.model_name}, concurrency={run_concurrency}, "
-                f"use_custom_tools={setting.use_custom_tools}) ==="
+                f"use_custom_tools={setting.use_custom_tools}, github_tokens={run_github_tokens}) ==="
             )
 
             runner = ParallelBenchmarkRunner(
@@ -634,14 +661,14 @@ async def _run_settings_suite(
                 concurrency=run_concurrency,
                 output_dir=run_output_dir,
                 max_retries=max_retries,
-                github_tokens=github_tokens,
+                github_tokens=run_github_tokens,
                 min_concurrency=min_concurrency,
                 memory_threshold=memory_threshold,
             )
             try:
                 await runner.run()
             finally:
-                _cleanup_github_repos(github_tokens)
+                _cleanup_github_repos(run_github_tokens)
 
             merged_path = os.path.join(runner._output_dir, "merged_results.json")
             merged_summary: Dict[str, Any] = {}
@@ -656,6 +683,7 @@ async def _run_settings_suite(
                 "base_url": setting.base_url,
                 "use_custom_tools": setting.use_custom_tools,
                 "concurrency": run_concurrency,
+                "github_tokens": run_github_tokens,
                 "output_dir": runner._output_dir,
                 "merged_results": merged_path,
                 "summary": merged_summary,

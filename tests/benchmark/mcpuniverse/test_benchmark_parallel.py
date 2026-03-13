@@ -355,8 +355,33 @@ class TestSettingsOverrides(unittest.TestCase):
             self.assertEqual(settings[0].model_name, "qwen")
             self.assertEqual(settings[0].concurrency, 2)
             self.assertTrue(settings[0].use_custom_tools)
+            self.assertIsNone(settings[0].github_tokens)
         finally:
             os.unlink(settings_path)
+
+    def test_load_run_settings_supports_setting_level_github_tokens(self):
+        payload = {
+            "settings": [
+                {
+                    "name": "s1",
+                    "type": "openai",
+                    "model_name": "qwen",
+                    "github_tokens": "tokens/a.csv",
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = os.path.join(tmpdir, "settings.yaml")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(payload, f)
+
+            settings = _load_run_settings(settings_path)
+
+        self.assertEqual(len(settings), 1)
+        self.assertEqual(
+            settings[0].github_tokens,
+            os.path.join(tmpdir, "tokens", "a.csv"),
+        )
 
     def test_write_overridden_config_updates_llm_type(self):
         docs = [
@@ -533,7 +558,7 @@ class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):
         ]
         settings_payload = {
             "settings": [
-                {"name": "s1", "model_name": "m1"},
+                {"name": "s1", "model_name": "m1", "github_tokens": "tokens_1.csv"},
                 {"name": "s2", "model_name": "m2"},
             ]
         }
@@ -547,9 +572,12 @@ class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):
             with open(settings_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(settings_payload, f)
 
+            runner_token_files = []
+
             class FakeRunner:
                 def __init__(self, config, concurrency, output_dir, max_retries, github_tokens, min_concurrency, memory_threshold):
                     self._output_dir = output_dir
+                    runner_token_files.append(github_tokens)
 
                 async def run(self):
                     os.makedirs(self._output_dir, exist_ok=True)
@@ -562,13 +590,21 @@ class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):
                         default_concurrency=1,
                         output_dir=output_dir,
                         max_retries=0,
-                        github_tokens="github_token.csv",
+                        github_tokens=None,
                         min_concurrency=1,
                         memory_threshold=0.6,
                     )
 
             self.assertEqual(mock_cleanup.call_count, 2)
-            mock_cleanup.assert_any_call("github_token.csv")
+            self.assertEqual(
+                runner_token_files,
+                [
+                    os.path.join(tmpdir, "tokens_1.csv"),
+                    None,
+                ],
+            )
+            mock_cleanup.assert_any_call(os.path.join(tmpdir, "tokens_1.csv"))
+            mock_cleanup.assert_any_call(None)
 
 
 class TestAdaptiveSemaphore(unittest.IsolatedAsyncioTestCase):
