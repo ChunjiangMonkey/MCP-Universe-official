@@ -97,6 +97,7 @@ class BaseLLM(ExportConfigMixin, metaclass=ComponentABCMeta):
         if not self.support_tool_call():
             kwargs.pop("callable_tools", None)
         tracer = tracer if tracer else Tracer()
+        request_data = self._extract_trace_request_data(kwargs)
 
         with tracer.sprout() as t:
             send_message(callbacks, message=CallbackMessage(
@@ -138,24 +139,30 @@ class BaseLLM(ExportConfigMixin, metaclass=ComponentABCMeta):
                 else:
                     response_data = response
 
-                t.add({
+                trace_record = {
                     "type": "llm",
                     "class": self.__class__.__name__,
                     "config": self.config.to_dict(),
                     "messages": messages_dict,
                     "response": response_data,
                     "error": ""
-                })
+                }
+                if request_data:
+                    trace_record["request"] = request_data
+                t.add(trace_record)
             except Exception as e:
                 tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-                t.add({
+                trace_record = {
                     "type": "llm",
                     "class": self.__class__.__name__,
                     "config": self.config.to_dict(),
                     "messages": messages_dict,
                     "response": str(e) + "\n" + tb_str,
                     "error": str(e) + "\n" + tb_str
-                })
+                }
+                if request_data:
+                    trace_record["request"] = request_data
+                t.add(trace_record)
                 send_message(callbacks, message=CallbackMessage(
                     source=self.id, type=MessageType.ERROR, data=str(e),
                     project_id=self.project_id))
@@ -201,6 +208,38 @@ class BaseLLM(ExportConfigMixin, metaclass=ComponentABCMeta):
             source=self.id, type=MessageType.STATUS, data=Status.SUCCEEDED,
             project_id=self.project_id))
         return response
+
+    def _extract_trace_request_data(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Collect request fields that are useful for debugging LLM calls.
+
+        This keeps trace payloads compact while preserving the candidate tool
+        definitions that were sent to the model.
+        """
+        request_data = {}
+        for key in ("tools", "callable_tools", "remote_mcp"):
+            if key in kwargs:
+                request_data[key] = self._serialize_trace_value(kwargs[key])
+        return request_data
+
+    def _serialize_trace_value(self, value: Any) -> Any:
+        """Convert common request objects into trace-safe JSON-like values."""
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="json")
+        if isinstance(value, dict):
+            return {
+                key: self._serialize_trace_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_trace_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return self._serialize_trace_value(value.to_dict())
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            return self._serialize_trace_value(value.model_dump(mode="json"))
+        return str(value)
 
     async def _call_generate(
             self,
