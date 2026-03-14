@@ -28,6 +28,8 @@ from .types import AgentResponse
 
 DEFAULT_CONFIG_FOLDER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
+CUSTOM_TOOL_NAMES = {"answer", "write_todos"}
+
 
 @dataclass
 class ReActConfig(BaseAgentConfig):
@@ -39,11 +41,13 @@ class ReActConfig(BaseAgentConfig):
         context_examples (str): Additional context examples for the agent.
         max_iterations (int): Maximum number of reasoning iterations.
         summarize_tool_response (bool): Whether to summarize tool responses using the LLM.
+        use_custom_tools (bool): Whether to use custom tools (write_todos) with enhanced prompt.
     """
     system_prompt: str = os.path.join(DEFAULT_CONFIG_FOLDER, "react_prompt.j2")
     context_examples: str = ""
     max_iterations: int = 5
     summarize_tool_response: bool = False
+    use_custom_tools: bool = False
 
 
 class ReAct(BaseAgent):
@@ -98,8 +102,11 @@ class ReAct(BaseAgent):
         params.update(self._config.template_vars)
         if self._history:
             params.update({"HISTORY": "\n\n".join(self._history)})
+        system_prompt = self._config.system_prompt
+        if self._config.use_custom_tools:
+            system_prompt = os.path.join(DEFAULT_CONFIG_FOLDER, "custom_react_prompt.j2")
         return build_system_prompt(
-            system_prompt_template=self._config.system_prompt,
+            system_prompt_template=system_prompt,
             tool_prompt_template=self._config.tools_prompt,
             tools=self._tools,
             **params
@@ -202,6 +209,42 @@ class ReAct(BaseAgent):
                             history_type="action input",
                             message=str(action.get("arguments", "none"))
                         )
+
+                        # Intercept custom tools (answer, write_todos)
+                        if (self._config.use_custom_tools
+                                and action.get("tool") in CUSTOM_TOOL_NAMES):
+                            if action["tool"] == "answer":
+                                answer_content = action.get("arguments", {}).get("content", "")
+                                self._add_history(
+                                    history_type="answer",
+                                    message=answer_content
+                                )
+                                await self._send_callback_message(
+                                    callbacks=callbacks,
+                                    iter_num=iter_num,
+                                    thought=parsed_response["thought"],
+                                    answer=answer_content
+                                )
+                                return AgentResponse(
+                                    name=self._name,
+                                    class_name=self.__class__.__name__,
+                                    response=answer_content,
+                                    trace_id=tracer.trace_id
+                                )
+                            elif action["tool"] == "write_todos":
+                                result = "Todos updated successfully."
+                                self._add_history(
+                                    history_type="result", message=result
+                                )
+                                await self._send_callback_message(
+                                    callbacks=callbacks,
+                                    iter_num=iter_num,
+                                    thought=parsed_response["thought"],
+                                    action=parsed_response["action"],
+                                    result=result
+                                )
+                                continue
+
                         try:
                             tool_result = await self.call_tool(action, tracer=tracer, callbacks=callbacks)
                             tool_content = tool_result.content[0]
