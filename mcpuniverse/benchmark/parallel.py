@@ -122,6 +122,7 @@ class RunSetting:
     name: str
     model_name: str
     llm_type: Optional[str] = None
+    agent_type: Optional[str] = None
     base_url: Optional[str] = None
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
@@ -528,6 +529,12 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
                 raise ValueError(f"settings[{idx}].type must be a non-empty string")
             llm_type = llm_type.strip()
 
+        agent_type = item.get("agent_type")
+        if agent_type is not None:
+            if not isinstance(agent_type, str) or not agent_type.strip():
+                raise ValueError(f"settings[{idx}].agent_type must be a non-empty string")
+            agent_type = agent_type.strip()
+
         base_url = item.get("base_url", None)
         if base_url is not None and not isinstance(base_url, str):
             raise ValueError(f"settings[{idx}].base_url must be a string")
@@ -551,6 +558,7 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             name=name.strip(),
             model_name=model_name.strip(),
             llm_type=llm_type,
+            agent_type=agent_type,
             base_url=base_url,
             concurrency=concurrency,
             use_custom_tools=use_custom_tools,
@@ -590,18 +598,23 @@ def _write_overridden_config(
                 config["base_url"] = setting.base_url
             llm_updates += 1
 
-        if kind == "agent" and setting.use_custom_tools is not None:
-            config["use_custom_tools"] = setting.use_custom_tools
-            agent_updates += 1
+        if kind == "agent":
+            if setting.agent_type is not None:
+                spec["type"] = setting.agent_type
+            if setting.use_custom_tools is not None:
+                config["use_custom_tools"] = setting.use_custom_tools
+            if setting.agent_type is not None or setting.use_custom_tools is not None:
+                agent_updates += 1
 
     if llm_updates == 0:
         raise ValueError(
             f"No `kind: llm` document found in config {source_config_path}; cannot apply model_name override"
         )
-    if setting.use_custom_tools is not None and agent_updates == 0:
+    has_agent_overrides = setting.agent_type is not None or setting.use_custom_tools is not None
+    if has_agent_overrides and agent_updates == 0:
         print(
             f"[warning] No `kind: agent` document found in {source_config_path}; "
-            "use_custom_tools override skipped."
+            "agent_type/use_custom_tools override skipped."
         )
 
     os.makedirs(os.path.dirname(output_config_path), exist_ok=True)
