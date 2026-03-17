@@ -124,6 +124,12 @@ class RunSetting:
     llm_type: Optional[str] = None
     agent_type: Optional[str] = None
     base_url: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
     github_tokens: Optional[str] = None
@@ -539,6 +545,48 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
         if base_url is not None and not isinstance(base_url, str):
             raise ValueError(f"settings[{idx}].base_url must be a string")
 
+        temperature = item.get("temperature")
+        if temperature is not None:
+            try:
+                temperature = float(temperature)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].temperature must be a number") from exc
+
+        top_p = item.get("top_p")
+        if top_p is not None:
+            try:
+                top_p = float(top_p)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].top_p must be a number") from exc
+
+        top_k = item.get("top_k")
+        if top_k is not None:
+            try:
+                top_k = int(top_k)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].top_k must be an integer") from exc
+
+        min_p = item.get("min_p")
+        if min_p is not None:
+            try:
+                min_p = float(min_p)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].min_p must be a number") from exc
+
+        presence_penalty = item.get("presence_penalty")
+        if presence_penalty is not None:
+            try:
+                presence_penalty = float(presence_penalty)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].presence_penalty must be a number") from exc
+
+        repetition_penalty = item.get("repetition_penalty")
+        if repetition_penalty is not None:
+            try:
+                repetition_penalty = float(repetition_penalty)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"settings[{idx}].repetition_penalty must be a number") from exc
+
         use_custom_tools = item.get("use_custom_tools")
         if use_custom_tools is not None:
             use_custom_tools = _coerce_bool(use_custom_tools, f"settings[{idx}].use_custom_tools")
@@ -560,6 +608,12 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             llm_type=llm_type,
             agent_type=agent_type,
             base_url=base_url,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
             concurrency=concurrency,
             use_custom_tools=use_custom_tools,
             github_tokens=github_tokens,
@@ -573,7 +627,7 @@ def _write_overridden_config(
     output_config_path: str,
     setting: RunSetting,
 ) -> None:
-    """Write a temp config with model/type/base_url/use_custom_tools overrides."""
+    """Write a temp config with model/type/base_url/sampling/use_custom_tools overrides."""
     source_path = _resolve_config_path(source_config_path)
     docs = _parse_config_documents(source_path)
 
@@ -596,6 +650,18 @@ def _write_overridden_config(
             config["model_name"] = setting.model_name
             if setting.base_url is not None:
                 config["base_url"] = setting.base_url
+            if setting.temperature is not None:
+                config["temperature"] = setting.temperature
+            if setting.top_p is not None:
+                config["top_p"] = setting.top_p
+            if setting.top_k is not None:
+                config["top_k"] = setting.top_k
+            if setting.min_p is not None:
+                config["min_p"] = setting.min_p
+            if setting.presence_penalty is not None:
+                config["presence_penalty"] = setting.presence_penalty
+            if setting.repetition_penalty is not None:
+                config["repetition_penalty"] = setting.repetition_penalty
             llm_updates += 1
 
         if kind == "agent":

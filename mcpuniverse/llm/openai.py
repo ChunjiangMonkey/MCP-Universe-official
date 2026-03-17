@@ -30,8 +30,11 @@ class OpenAIConfig(BaseConfig):
         base_url (str): The base URL for the OpenAI API (default: "https://api.openai.com/v1").
         temperature (float): Controls randomness in output (default: 1.0).
         top_p (float): Controls diversity of output (default: 1.0).
+        top_k (int | None): Limits sampling to the top-k tokens when supported by the backend.
+        min_p (float | None): Minimum probability threshold when supported by the backend.
         frequency_penalty (float): Penalizes frequent token use (default: 0.0).
         presence_penalty (float): Penalizes repeated topics (default: 0.0).
+        repetition_penalty (float | None): Penalizes repeated token sequences when supported by the backend.
         max_completion_tokens (int): Maximum number of tokens in the completion (default: 2048).
         reasoning_effort (str): The reasoning effort to use (default: "medium").
         seed (int): Random seed for reproducibility (default: 12345).
@@ -43,8 +46,11 @@ class OpenAIConfig(BaseConfig):
     base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     temperature: float = 1.0
     top_p: float = 1.0
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    repetition_penalty: Optional[float] = None
     max_completion_tokens: int = 10000
     reasoning_effort: str = "medium"
     seed: int = 12345
@@ -103,6 +109,15 @@ class OpenAIModel(BaseLLM):
         for attempt in range(max_retries + 1):
             try:
                 client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url)
+                extra_body = dict(kwargs.pop("extra_body", {}) or {})
+                if self.config.top_k is not None:
+                    extra_body["top_k"] = self.config.top_k
+                if self.config.min_p is not None:
+                    extra_body["min_p"] = self.config.min_p
+                if self.config.repetition_penalty is not None:
+                    extra_body["repetition_penalty"] = self.config.repetition_penalty
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
                 # Models support the 'reasoning_effort' parameter.
                 # This set can be extended as new models are introduced.
                 _models_with_reasoning_effort_support = {"gpt-5", "o3", "o4-mini", "gpt-5-high"}
