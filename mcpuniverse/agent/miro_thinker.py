@@ -58,6 +58,11 @@ Input JSON schema: {"type": "object", "properties": {"todos": {"type": "array", 
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
+def _strip_think_tags(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks from *text*, returning the remainder."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
 def get_mcp_tools_description(tools: Dict[str, List[Tool]]) -> str:
     """
     Convert MCP Tool objects to MiroThinker prompt format.
@@ -418,11 +423,21 @@ class MiroThinker(BaseAgent):
                 })
                 continue
 
-            # Record assistant turn
+            # Record assistant turn (full text including <think>)
             messages.append({"role": "assistant", "content": response_text})
 
+            # Strip <think>...</think> for parsing purposes;
+            # record thinking content in history for observability.
+            think_match = re.search(r'<think>(.*?)</think>', response_text, re.DOTALL)
+            if think_match:
+                self._add_history(
+                    history_type="thinking",
+                    message=think_match.group(1).strip(),
+                )
+            cleaned_text = _strip_think_tags(response_text)
+
             # --- Try to parse MCP XML tool call ---
-            tool_call = parse_mcp_tool_call(response_text)
+            tool_call = parse_mcp_tool_call(cleaned_text)
 
             if tool_call is not None:
                 tool_name = tool_call["tool"]
@@ -543,7 +558,7 @@ class MiroThinker(BaseAgent):
 
             # --- No tool call: treat as content response ---
             result = await self._handle_content_response(
-                response_text, messages, iter_num, callbacks, tracer,
+                cleaned_text, messages, iter_num, callbacks, tracer,
             )
             if result is not None:
                 return result
