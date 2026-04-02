@@ -133,6 +133,7 @@ class RunSetting:
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
     github_tokens: Optional[str] = None
+    cleanup_github_repos_after_run: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -384,37 +385,6 @@ def _parse_config_documents(config_path: str) -> List[dict]:
         return list(yaml.safe_load_all(f))
 
 
-def _should_cleanup_github_repos(config_paths: List[str]) -> bool:
-    """Return whether post-run GitHub cleanup is enabled for a run.
-
-    The switch is read from each ``kind: benchmark`` document's
-    ``cleanup_github_repos_after_run`` field. Missing fields default to
-    ``True`` to preserve the previous behavior. When multiple benchmark docs
-    are present, any explicit ``false`` disables cleanup for the whole run.
-    """
-    for config_path in config_paths:
-        resolved_path = _resolve_config_path(config_path)
-        docs = _parse_config_documents(resolved_path)
-        for bench_idx, doc in enumerate(docs):
-            if not isinstance(doc, dict):
-                continue
-            if str(doc.get("kind", "")).lower() != "benchmark":
-                continue
-            spec = doc.get("spec", {})
-            if not isinstance(spec, dict):
-                continue
-            enabled = _coerce_bool(
-                spec.get("cleanup_github_repos_after_run", True),
-                (
-                    f"{resolved_path} benchmark[{bench_idx}]"
-                    ".cleanup_github_repos_after_run"
-                ),
-            )
-            if not enabled:
-                return False
-    return True
-
-
 def _resolve_config_path(config_path: str) -> str:
     """Resolve a config path using benchmark default folder fallback."""
     if os.path.exists(config_path):
@@ -633,6 +603,13 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
                 )
             github_tokens = _resolve_settings_path(github_tokens.strip(), settings_path)
 
+        cleanup_github_repos_after_run = item.get("cleanup_github_repos_after_run")
+        if cleanup_github_repos_after_run is not None:
+            cleanup_github_repos_after_run = _coerce_bool(
+                cleanup_github_repos_after_run,
+                f"settings[{idx}].cleanup_github_repos_after_run",
+            )
+
         settings.append(RunSetting(
             name=name.strip(),
             model_name=model_name.strip(),
@@ -648,6 +625,7 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             concurrency=concurrency,
             use_custom_tools=use_custom_tools,
             github_tokens=github_tokens,
+            cleanup_github_repos_after_run=cleanup_github_repos_after_run,
         ))
 
     return settings
@@ -759,7 +737,9 @@ async def _run_settings_suite(
 
             run_concurrency = setting.concurrency or default_concurrency
             run_github_tokens = github_tokens or setting.github_tokens
-            run_cleanup_github_repos = _should_cleanup_github_repos(materialized_configs)
+            run_cleanup_github_repos = setting.cleanup_github_repos_after_run
+            if run_cleanup_github_repos is None:
+                run_cleanup_github_repos = True
             run_output_dir = os.path.join(suite_dir, f"{idx:02d}_{setting_name}")
             print(
                 f"\n=== Setting {idx + 1}/{len(settings)}: {setting.name} "
@@ -1517,7 +1497,6 @@ def main() -> None:
         ))
     elif args.config:
         # Orchestrator mode — single config or multiple configs pooled
-        run_cleanup_github_repos = _should_cleanup_github_repos(args.config)
         runner = ParallelBenchmarkRunner(
             config=args.config,
             concurrency=args.concurrency,
@@ -1530,10 +1509,7 @@ def main() -> None:
         try:
             asyncio.run(runner.run())
         finally:
-            if run_cleanup_github_repos:
-                _cleanup_github_repos(args.github_tokens)
-            else:
-                print("[cleanup] Skipped: cleanup_github_repos_after_run=false in benchmark config")
+            _cleanup_github_repos(args.github_tokens)
     else:
         parser.error("Provide config path(s) or use --worker mode")
 
