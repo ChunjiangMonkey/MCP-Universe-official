@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections import deque
 
 import psutil
@@ -109,11 +110,85 @@ class WorkerResult:
     trace_id: str = ""
     error_category: ErrorCategory = ErrorCategory.UNKNOWN
     stderr: str = ""
+    stdout: str = ""
     return_code: int = -1
     duration_seconds: float = 0.0
     attempt: int = 1
     start_time: str = ""
     end_time: str = ""
+    error_message: str = ""
+    error_type: str = ""
+    error_traceback: str = ""
+    output_json: str = ""
+    log_path: str = ""
+
+
+def _truncate_text(text: str, limit: int = 2000) -> str:
+    """Return *text* truncated to *limit* chars while preserving the tail."""
+    if not text or len(text) <= limit:
+        return text
+    head = max(limit // 2, 1)
+    tail = max(limit - head - len("\n...\n"), 1)
+    return f"{text[:head]}\n...\n{text[-tail:]}"
+
+
+def _best_effort_task_path_from_config(config_path: str) -> str:
+    """Best-effort extraction of the single task path from a worker config."""
+    try:
+        docs = _parse_config_documents(config_path)
+    except Exception:
+        return ""
+
+    for doc in docs:
+        if doc.get("kind", "").lower() != "benchmark":
+            continue
+        tasks = doc.get("spec", {}).get("tasks", [])
+        if tasks:
+            return str(tasks[0])
+    return ""
+
+
+def _build_worker_error_payload(
+    *,
+    config_path: str,
+    output_path: str,
+    log_file: str,
+    start_time: str,
+    end_time: str,
+    exc: Exception,
+) -> Dict[str, Any]:
+    """Build a structured worker error payload for the result JSON."""
+    return {
+        "task_path": _best_effort_task_path_from_config(config_path),
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "error_traceback": traceback.format_exc(),
+        "config_path": config_path,
+        "output_path": output_path,
+        "log_file": log_file,
+        "start_time": start_time,
+        "end_time": end_time,
+    }
+
+
+def _worker_failure_details(wr: WorkerResult) -> Dict[str, Any]:
+    """Convert a failed worker result into a compact JSON-serializable dict."""
+    return {
+        "error_category": wr.error_category.name,
+        "error_type": wr.error_type,
+        "error_message": wr.error_message,
+        "error_traceback": wr.error_traceback,
+        "return_code": wr.return_code,
+        "attempt": wr.attempt,
+        "duration_seconds": round(wr.duration_seconds, 2),
+        "start_time": wr.start_time,
+        "end_time": wr.end_time,
+        "output_json": wr.output_json,
+        "log_path": wr.log_path,
+        "stderr_excerpt": _truncate_text(wr.stderr),
+        "stdout_excerpt": _truncate_text(wr.stdout),
+    }
 
 
 @dataclass
@@ -887,11 +962,14 @@ async def _run_worker(config_path: str, output_path: str, log_file: str) -> None
 
     except Exception as exc:
         end_time = datetime.now().isoformat()
-        payload = {
-            "error": str(exc),
-            "start_time": start_time,
-            "end_time": end_time,
-        }
+        payload = _build_worker_error_payload(
+            config_path=config_path,
+            output_path=output_path,
+            log_file=log_file,
+            start_time=start_time,
+            end_time=end_time,
+            exc=exc,
+        )
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         sys.exit(1)
@@ -1087,6 +1165,7 @@ class ParallelBenchmarkRunner:
             )
             stdout_bytes, stderr_bytes = await proc.communicate()
             duration = time.monotonic() - start
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
             stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
             if proc.returncode == 0 and os.path.isfile(output_json):
@@ -1094,16 +1173,31 @@ class ParallelBenchmarkRunner:
                     with open(output_json, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     if "error" in data:
-                        error_cat = classify_error(data["error"] + stderr_text)
+                        error_text = "\n".join(
+                            part for part in [
+                                data.get("error_type", ""),
+                                data.get("error_message", ""),
+                                data.get("error_traceback", ""),
+                                stderr_text,
+                            ] if part
+                        )
+                        error_cat = classify_error(error_text)
                         wr = WorkerResult(
                             task_path=task_item.task_path, success=False,
                             category=task_item.category,
                             temp_yaml=task_item.temp_yaml,
-                            error_category=error_cat, stderr=stderr_text,
+                            error_category=error_cat,
+                            stderr=stderr_text,
+                            stdout=stdout_text,
                             return_code=proc.returncode, duration_seconds=duration,
                             attempt=attempt,
                             start_time=data.get("start_time", ""),
                             end_time=data.get("end_time", ""),
+                            error_message=data.get("error_message", data.get("error", "")),
+                            error_type=data.get("error_type", ""),
+                            error_traceback=data.get("error_traceback", ""),
+                            output_json=output_json,
+                            log_path=data.get("log_file", log_path),
                         )
                     else:
                         wr = WorkerResult(
@@ -1112,10 +1206,13 @@ class ParallelBenchmarkRunner:
                             category=task_item.category,
                             temp_yaml=task_item.temp_yaml,
                             trace_id=data.get("trace_id", ""),
+                            stdout=stdout_text,
                             return_code=0, duration_seconds=duration,
                             attempt=attempt,
                             start_time=data.get("start_time", ""),
                             end_time=data.get("end_time", ""),
+                            output_json=output_json,
+                            log_path=log_path,
                         )
                 except (json.JSONDecodeError, KeyError) as exc:
                     wr = WorkerResult(
@@ -1124,22 +1221,45 @@ class ParallelBenchmarkRunner:
                         temp_yaml=task_item.temp_yaml,
                         error_category=ErrorCategory.UNKNOWN,
                         stderr=f"JSON parse error: {exc}\n{stderr_text}",
+                        stdout=stdout_text,
                         return_code=proc.returncode, duration_seconds=duration,
                         attempt=attempt,
+                        error_message=f"Failed to parse worker output JSON: {exc}",
+                        error_type=type(exc).__name__,
+                        error_traceback=traceback.format_exc(),
+                        output_json=output_json,
+                        log_path=log_path,
                     )
             else:
-                error_cat = classify_error(stderr_text)
+                error_text = "\n".join(
+                    part for part in [stderr_text, stdout_text] if part
+                )
+                error_cat = classify_error(error_text)
                 wr = WorkerResult(
                     task_path=task_item.task_path, success=False,
                     category=task_item.category,
                     temp_yaml=task_item.temp_yaml,
-                    error_category=error_cat, stderr=stderr_text,
+                    error_category=error_cat,
+                    stderr=stderr_text,
+                    stdout=stdout_text,
                     return_code=proc.returncode or 1, duration_seconds=duration,
                     attempt=attempt,
+                    error_message=(
+                        f"Worker exited with code {proc.returncode or 1} without a valid result file"
+                    ),
+                    error_type="WorkerProcessError",
+                    output_json=output_json,
+                    log_path=log_path,
                 )
 
             status = "\033[32mOK\033[0m" if wr.success else f"\033[31mFAIL ({wr.error_category.name})\033[0m"
             print(f"  [{attempt}] Finished: {task_item.task_path} — {status} ({duration:.1f}s)")
+            if not wr.success:
+                detail = wr.error_message or _truncate_text(wr.stderr, limit=240)
+                if detail:
+                    print(f"      error: {_truncate_text(detail, limit=240)}")
+                print(f"      output: {output_json}")
+                print(f"      trace: {log_path}")
 
             await self._feedback.record(wr)
             return wr
@@ -1176,7 +1296,10 @@ class ParallelBenchmarkRunner:
                         task_results[task_path] = {"evaluation_results": eval_objs}
                         task_trace_ids[task_path] = wr.trace_id
                     else:
-                        task_results[task_path] = {"evaluation_results": []}
+                        task_results[task_path] = {
+                            "evaluation_results": [],
+                            "worker_error": _worker_failure_details(wr) if wr else None,
+                        }
                         task_trace_ids[task_path] = ""
 
                 merged.append(BenchmarkResult(
@@ -1281,6 +1404,7 @@ class ParallelBenchmarkRunner:
         total_evals_passed = 0
         total_tasks = 0
         total_tasks_passed = 0
+        worker_result_map = {wr.task_path: wr for wr in worker_results}
         task_categories = {
             wr.task_path: (wr.category or "uncategorized")
             for wr in worker_results
@@ -1308,14 +1432,18 @@ class ParallelBenchmarkRunner:
                 category_summary["task_total"] += 1
 
                 if not eval_results:
-                    task_summaries.append({
+                    task_summary = {
                         "category": category,
                         "task": task_path,
                         "evals_total": 0,
                         "evals_passed": 0,
                         "evals_failed": 0,
                         "task_passed": False,
-                    })
+                    }
+                    wr = worker_result_map.get(task_path)
+                    if wr and not wr.success:
+                        task_summary["worker_error"] = _worker_failure_details(wr)
+                    task_summaries.append(task_summary)
                     continue
 
                 n_passed = sum(
@@ -1412,6 +1540,15 @@ class ParallelBenchmarkRunner:
                 for name in sorted(category_summaries)
             },
             "tasks": task_summaries,
+            "worker_failures": [
+                {
+                    "category": wr.category or "uncategorized",
+                    "task": wr.task_path,
+                    **_worker_failure_details(wr),
+                }
+                for wr in worker_results
+                if not wr.success
+            ],
         }
 
 
