@@ -221,6 +221,23 @@ class TaskItem:
     source_config: str
 
 
+@dataclass
+class TaskProgress:
+    """Track completed full benchmark tasks for a scheduler round."""
+
+    total: int
+    label: str = "Task progress"
+    completed: int = 0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    async def mark_completed(self) -> Tuple[int, int, int]:
+        """Increment the completed count and return completed, remaining, total."""
+        async with self._lock:
+            self.completed += 1
+            remaining = max(self.total - self.completed, 0)
+            return self.completed, remaining, self.total
+
+
 # ---------------------------------------------------------------------------
 # GitHub token loading
 # ---------------------------------------------------------------------------
@@ -1047,6 +1064,7 @@ class ParallelBenchmarkRunner:
             semaphore = self._feedback.semaphore
 
             # First pass
+            first_pass_progress = TaskProgress(total=len(task_items), label="Full task progress")
             coros = []
             for task_item in task_items:
                 out_json, log_path = _task_output_paths(
@@ -1056,7 +1074,14 @@ class ParallelBenchmarkRunner:
                     category=task_item.category,
                 )
                 coros.append(
-                    self._launch_worker(task_item, out_json, log_path, semaphore, attempt=1)
+                    self._launch_worker(
+                        task_item,
+                        out_json,
+                        log_path,
+                        semaphore,
+                        attempt=1,
+                        progress=first_pass_progress,
+                    )
                 )
 
             worker_results: List[WorkerResult] = await asyncio.gather(*coros)
@@ -1072,10 +1097,13 @@ class ParallelBenchmarkRunner:
                 print(f"\n--- Retry round {retry_round}: {len(failed)} failed tasks ---")
 
                 # Rebuild temp yamls for failed tasks
+                retryable = [wr for wr in failed if wr.temp_yaml]
+                retry_progress = TaskProgress(
+                    total=len(retryable),
+                    label=f"Retry round {retry_round} progress",
+                )
                 retry_coros = []
-                for wr in failed:
-                    if not wr.temp_yaml:
-                        continue
+                for wr in retryable:
                     out_json, log_path = _task_output_paths(
                         self._output_dir,
                         wr.task_path,
@@ -1094,6 +1122,7 @@ class ParallelBenchmarkRunner:
                             log_path,
                             semaphore,
                             attempt=retry_round + 1,
+                            progress=retry_progress,
                         )
                     )
 
@@ -1134,6 +1163,7 @@ class ParallelBenchmarkRunner:
         log_path: str,
         semaphore: AdaptiveSemaphore,
         attempt: int = 1,
+        progress: Optional[TaskProgress] = None,
     ) -> WorkerResult:
         """Launch a single worker subprocess under semaphore control."""
         delay = await self._feedback.wait_before_launch()
@@ -1253,7 +1283,11 @@ class ParallelBenchmarkRunner:
                 )
 
             status = "\033[32mOK\033[0m" if wr.success else f"\033[31mFAIL ({wr.error_category.name})\033[0m"
-            print(f"  [{attempt}] Finished: {task_item.task_path} — {status} ({duration:.1f}s)")
+            progress_text = ""
+            if progress is not None:
+                completed, remaining, total = await progress.mark_completed()
+                progress_text = f" | done {completed}/{total}, remaining {remaining}"
+            print(f"  [{attempt}] Finished: {task_item.task_path} — {status} ({duration:.1f}s){progress_text}")
             if not wr.success:
                 detail = wr.error_message or _truncate_text(wr.stderr, limit=240)
                 if detail:
