@@ -203,6 +203,7 @@ class RunSetting:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     min_p: Optional[float] = None
+    max_completion_tokens: Optional[int] = None
     presence_penalty: Optional[float] = None
     repetition_penalty: Optional[float] = None
     concurrency: Optional[int] = None
@@ -219,6 +220,7 @@ class TaskItem:
     temp_yaml: str
     category: str
     source_config: str
+    domain: str = ""
 
 
 @dataclass
@@ -503,6 +505,72 @@ def _task_namespace(task_path: str) -> str:
     return parts[0] if parts else ""
 
 
+def _task_domain(task_path: str, category: Optional[str] = None) -> str:
+    """Infer the logical sampling domain for a benchmark task path."""
+    normalized = str(task_path).replace("\\", "/").lstrip("/")
+    parts = [part for part in normalized.split("/") if part]
+    if parts and parts[0] == "mcpuniverse":
+        parts = parts[1:]
+
+    if len(parts) >= 3 and parts[0] == "mcpmark" and parts[1] == "configs":
+        suite = parts[2]
+        if len(parts) >= 5:
+            return f"{suite}/{parts[3]}"
+        if len(parts) >= 4:
+            stem, _ = os.path.splitext(parts[3])
+            prefix, sep, _ = stem.partition("-")
+            return f"{suite}/{prefix}" if sep and prefix else suite
+        return suite
+
+    if parts and parts[0] == "multi_server":
+        stem, _ = os.path.splitext(os.path.basename(normalized))
+        match = re.match(r"multi-server_task_(.+)_\d+$", stem)
+        if match:
+            return f"multi_server/{match.group(1)}"
+
+    if len(parts) > 1:
+        return parts[0]
+    if parts:
+        return category or parts[0]
+    return category or "uncategorized"
+
+
+def _weighted_task_shuffle(task_items: List[TaskItem]) -> List[TaskItem]:
+    """Randomize tasks by sampling domains weighted by remaining task count."""
+    if len(task_items) < 2:
+        return list(task_items)
+
+    buckets: Dict[str, List[TaskItem]] = {}
+    for task_item in task_items:
+        domain = task_item.domain or task_item.category or "uncategorized"
+        buckets.setdefault(domain, []).append(task_item)
+
+    for bucket in buckets.values():
+        random.shuffle(bucket)
+
+    active_domains = list(buckets.keys())
+    random.shuffle(active_domains)
+    weighted: List[TaskItem] = []
+
+    while active_domains:
+        total_remaining = sum(len(buckets[domain]) for domain in active_domains)
+        choice = random.randrange(total_remaining)
+        cumulative = 0
+        selected_domain = active_domains[-1]
+        for domain in active_domains:
+            cumulative += len(buckets[domain])
+            if choice < cumulative:
+                selected_domain = domain
+                break
+
+        bucket = buckets[selected_domain]
+        weighted.append(bucket.pop())
+        if not bucket:
+            active_domains.remove(selected_domain)
+
+    return weighted
+
+
 def _config_category(config_path: str, docs: Optional[List[dict]] = None) -> str:
     """Infer the logical benchmark category for a config file."""
     if docs is None:
@@ -666,6 +734,19 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"settings[{idx}].min_p must be a number") from exc
 
+        max_completion_tokens = item.get("max_completion_tokens")
+        if max_completion_tokens is not None:
+            try:
+                max_completion_tokens = int(max_completion_tokens)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"settings[{idx}].max_completion_tokens must be an integer"
+                ) from exc
+            if max_completion_tokens < 1:
+                raise ValueError(
+                    f"settings[{idx}].max_completion_tokens must be >= 1"
+                )
+
         presence_penalty = item.get("presence_penalty")
         if presence_penalty is not None:
             try:
@@ -712,6 +793,7 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            max_completion_tokens=max_completion_tokens,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             concurrency=concurrency,
@@ -759,6 +841,8 @@ def _write_overridden_config(
                 config["top_k"] = setting.top_k
             if setting.min_p is not None:
                 config["min_p"] = setting.min_p
+            if setting.max_completion_tokens is not None:
+                config["max_completion_tokens"] = setting.max_completion_tokens
             if setting.presence_penalty is not None:
                 config["presence_penalty"] = setting.presence_penalty
             if setting.repetition_penalty is not None:
@@ -932,6 +1016,7 @@ def _split_into_single_task_yamls(
                 temp_yaml=temp_yaml,
                 category=category,
                 source_config=config_path,
+                domain=_task_domain(task_path, category=category),
             ))
             task_index += 1
 
@@ -1050,7 +1135,7 @@ class ParallelBenchmarkRunner:
             if not task_items:
                 print("No tasks found in config(s).")
                 return []
-            random.shuffle(task_items)
+            task_items = _weighted_task_shuffle(task_items)
 
             # Round-robin assign GitHub accounts to tasks
             self._task_account_map: Dict[str, Tuple[str, str]] = {}
@@ -1117,6 +1202,7 @@ class ParallelBenchmarkRunner:
                                 temp_yaml=wr.temp_yaml,
                                 category=wr.category or "uncategorized",
                                 source_config="",
+                                domain=_task_domain(wr.task_path, category=wr.category),
                             ),
                             out_json,
                             log_path,
