@@ -208,6 +208,7 @@ class RunSetting:
     repetition_penalty: Optional[float] = None
     concurrency: Optional[int] = None
     use_custom_tools: Optional[bool] = None
+    append_iteration_user_message: Optional[bool] = None
     github_tokens: Optional[str] = None
     cleanup_github_repos_after_run: Optional[bool] = None
 
@@ -765,6 +766,13 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
         if use_custom_tools is not None:
             use_custom_tools = _coerce_bool(use_custom_tools, f"settings[{idx}].use_custom_tools")
 
+        append_iteration_user_message = item.get("append_iteration_user_message")
+        if append_iteration_user_message is not None:
+            append_iteration_user_message = _coerce_bool(
+                append_iteration_user_message,
+                f"settings[{idx}].append_iteration_user_message",
+            )
+
         github_tokens = item.get(
             "github_tokens",
             item.get("github_token_file", item.get("github_token_path")),
@@ -798,6 +806,7 @@ def _load_run_settings(settings_path: str) -> List[RunSetting]:
             repetition_penalty=repetition_penalty,
             concurrency=concurrency,
             use_custom_tools=use_custom_tools,
+            append_iteration_user_message=append_iteration_user_message,
             github_tokens=github_tokens,
             cleanup_github_repos_after_run=cleanup_github_repos_after_run,
         ))
@@ -810,7 +819,7 @@ def _write_overridden_config(
     output_config_path: str,
     setting: RunSetting,
 ) -> None:
-    """Write a temp config with model/type/base_url/sampling/use_custom_tools overrides."""
+    """Write a temp config with model/type/base_url/sampling/agent overrides."""
     source_path = _resolve_config_path(source_config_path)
     docs = _parse_config_documents(source_path)
 
@@ -854,18 +863,28 @@ def _write_overridden_config(
                 spec["type"] = setting.agent_type
             if setting.use_custom_tools is not None:
                 config["use_custom_tools"] = setting.use_custom_tools
-            if setting.agent_type is not None or setting.use_custom_tools is not None:
+            if setting.append_iteration_user_message is not None:
+                config["append_iteration_user_message"] = setting.append_iteration_user_message
+            if (
+                setting.agent_type is not None
+                or setting.use_custom_tools is not None
+                or setting.append_iteration_user_message is not None
+            ):
                 agent_updates += 1
 
     if llm_updates == 0:
         raise ValueError(
             f"No `kind: llm` document found in config {source_config_path}; cannot apply model_name override"
         )
-    has_agent_overrides = setting.agent_type is not None or setting.use_custom_tools is not None
+    has_agent_overrides = (
+        setting.agent_type is not None
+        or setting.use_custom_tools is not None
+        or setting.append_iteration_user_message is not None
+    )
     if has_agent_overrides and agent_updates == 0:
         print(
             f"[warning] No `kind: agent` document found in {source_config_path}; "
-            "agent_type/use_custom_tools override skipped."
+            "agent_type/use_custom_tools/append_iteration_user_message override skipped."
         )
 
     os.makedirs(os.path.dirname(output_config_path), exist_ok=True)

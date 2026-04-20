@@ -16,14 +16,17 @@ from mcpuniverse.benchmark.parallel import (
     ErrorCategory,
     FeedbackController,
     RunSetting,
+    TaskItem,
     WorkerResult,
     _cleanup_github_repos,
     _load_run_settings,
     _parse_config_documents,
     _run_settings_suite,
     _split_into_single_task_yamls,
+    _task_domain,
     _task_output_paths,
     _task_output_relpath,
+    _weighted_task_shuffle,
     _write_overridden_config,
     classify_error,
 )
@@ -221,6 +224,34 @@ class TestFeedbackController(unittest.IsolatedAsyncioTestCase):
 class TestYamlSplitting(unittest.TestCase):
     """Tests for YAML config splitting."""
 
+    def test_task_domain_for_mcpuniverse_path(self):
+        domain = _task_domain("mcpuniverse/web_search/info_search_task_0001.json")
+        self.assertEqual(domain, "web_search")
+
+    def test_task_domain_for_mcpmark_category_path(self):
+        domain = _task_domain("mcpmark/configs/filesystem/desktop/music_report.json")
+        self.assertEqual(domain, "filesystem/desktop")
+
+    def test_task_domain_for_mcpmark_playwright_prefix(self):
+        domain = _task_domain("mcpmark/configs/playwright/eval_web-extraction_table.json")
+        self.assertEqual(domain, "playwright/eval_web")
+
+    def test_weighted_task_shuffle_uses_remaining_domain_counts(self):
+        tasks = [
+            TaskItem(f"a_{idx}.json", f"a_{idx}.yaml", "cat", "cfg", domain="a")
+            for idx in range(3)
+        ] + [
+            TaskItem("b_0.json", "b_0.yaml", "cat", "cfg", domain="b")
+        ]
+
+        with patch("mcpuniverse.benchmark.parallel.random.shuffle", side_effect=lambda seq: None):
+            with patch("mcpuniverse.benchmark.parallel.random.randrange", side_effect=[0, 2, 0, 0]) as mock_randrange:
+                shuffled = _weighted_task_shuffle(tasks)
+
+        self.assertCountEqual([item.task_path for item in shuffled], [item.task_path for item in tasks])
+        self.assertEqual([item.domain for item in shuffled], ["a", "b", "a", "a"])
+        self.assertEqual([call.args[0] for call in mock_randrange.call_args_list], [4, 3, 2, 1])
+
     def test_split_creates_correct_count(self):
         # Create a temporary multi-task YAML
         docs = [
@@ -339,6 +370,8 @@ class TestSettingsOverrides(unittest.TestCase):
                     "model_name": "qwen",
                     "concurrency": 2,
                     "use_custom_tools": "true",
+                    "append_iteration_user_message": "false",
+                    "max_completion_tokens": 4096,
                 }
             ]
         }
@@ -355,6 +388,8 @@ class TestSettingsOverrides(unittest.TestCase):
             self.assertEqual(settings[0].model_name, "qwen")
             self.assertEqual(settings[0].concurrency, 2)
             self.assertTrue(settings[0].use_custom_tools)
+            self.assertFalse(settings[0].append_iteration_user_message)
+            self.assertEqual(settings[0].max_completion_tokens, 4096)
             self.assertIsNone(settings[0].github_tokens)
         finally:
             os.unlink(settings_path)
@@ -383,6 +418,30 @@ class TestSettingsOverrides(unittest.TestCase):
             os.path.join(tmpdir, "tokens", "a.csv"),
         )
 
+    def test_load_run_settings_supports_cleanup_toggle(self):
+        payload = {
+            "settings": [
+                {
+                    "name": "s1",
+                    "type": "openai",
+                    "model_name": "qwen",
+                    "cleanup_github_repos_after_run": False,
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        ) as f:
+            yaml.safe_dump(payload, f)
+            settings_path = f.name
+
+        try:
+            settings = _load_run_settings(settings_path)
+            self.assertEqual(len(settings), 1)
+            self.assertFalse(settings[0].cleanup_github_repos_after_run)
+        finally:
+            os.unlink(settings_path)
+
     def test_write_overridden_config_updates_llm_type(self):
         docs = [
             {
@@ -390,7 +449,7 @@ class TestSettingsOverrides(unittest.TestCase):
                 "spec": {
                     "name": "llm-1",
                     "type": "openrouter",
-                    "config": {"model_name": "old-model"},
+                    "config": {"model_name": "old-model", "max_completion_tokens": 1024},
                 },
             },
             {
@@ -419,7 +478,9 @@ class TestSettingsOverrides(unittest.TestCase):
                 llm_type="openai",
                 model_name="new-model",
                 base_url="http://127.0.0.1:8000/v1",
+                max_completion_tokens=8192,
                 use_custom_tools=True,
+                append_iteration_user_message=False,
             )
             _write_overridden_config(source_path, output_path, setting)
             overridden = _parse_config_documents(output_path)
@@ -429,7 +490,9 @@ class TestSettingsOverrides(unittest.TestCase):
             self.assertEqual(llm_doc["spec"]["type"], "openai")
             self.assertEqual(llm_doc["spec"]["config"]["model_name"], "new-model")
             self.assertEqual(llm_doc["spec"]["config"]["base_url"], "http://127.0.0.1:8000/v1")
+            self.assertEqual(llm_doc["spec"]["config"]["max_completion_tokens"], 8192)
             self.assertTrue(agent_doc["spec"]["config"]["use_custom_tools"])
+            self.assertFalse(agent_doc["spec"]["config"]["append_iteration_user_message"])
         finally:
             os.unlink(source_path)
             os.unlink(output_path)
@@ -605,6 +668,67 @@ class TestCleanupHooks(unittest.IsolatedAsyncioTestCase):
             )
             mock_cleanup.assert_any_call(os.path.join(tmpdir, "tokens_1.csv"))
             mock_cleanup.assert_any_call(None)
+
+    async def test_run_settings_suite_skips_cleanup_when_disabled_in_config(self):
+        docs = [
+            {
+                "kind": "llm",
+                "spec": {"name": "llm-1", "type": "openai", "config": {"model_name": "base"}},
+            },
+            {
+                "kind": "agent",
+                "spec": {"name": "agent-1", "type": "function-call", "config": {"llm": "llm-1"}},
+            },
+            {
+                "kind": "benchmark",
+                "spec": {
+                    "description": "bench",
+                    "agent": "agent-1",
+                    "tasks": ["task_a.json"],
+                },
+            },
+        ]
+        settings_payload = {
+            "settings": [
+                {
+                    "name": "s1",
+                    "model_name": "m1",
+                    "github_tokens": "tokens_1.csv",
+                    "cleanup_github_repos_after_run": False,
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "config.yaml")
+            settings_path = os.path.join(tmpdir, "settings.yaml")
+            output_dir = os.path.join(tmpdir, "results")
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump_all(docs, f, default_flow_style=False)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(settings_payload, f)
+
+            class FakeRunner:
+                def __init__(self, config, concurrency, output_dir, max_retries, github_tokens, min_concurrency, memory_threshold):
+                    self._output_dir = output_dir
+
+                async def run(self):
+                    os.makedirs(self._output_dir, exist_ok=True)
+
+            with patch("mcpuniverse.benchmark.parallel.ParallelBenchmarkRunner", FakeRunner):
+                with patch("mcpuniverse.benchmark.parallel._cleanup_github_repos") as mock_cleanup:
+                    await _run_settings_suite(
+                        settings_file=settings_path,
+                        config_paths=[config_path],
+                        default_concurrency=1,
+                        output_dir=output_dir,
+                        max_retries=0,
+                        github_tokens=None,
+                        min_concurrency=1,
+                        memory_threshold=0.6,
+                    )
+
+            mock_cleanup.assert_not_called()
 
 
 class TestAdaptiveSemaphore(unittest.IsolatedAsyncioTestCase):
