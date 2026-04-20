@@ -1,7 +1,12 @@
 import os
 import unittest
 from mcpuniverse.mcp.manager import MCPManager
-from mcpuniverse.agent.utils import get_tools_description, build_system_prompt
+from mcpuniverse.agent.utils import (
+    SUMMARIZE_PROMPT,
+    build_system_prompt,
+    get_iteration_prompt_content,
+    get_tools_description,
+)
 
 
 class TestAgentUtils(unittest.IsolatedAsyncioTestCase):
@@ -27,6 +32,25 @@ class TestAgentUtils(unittest.IsolatedAsyncioTestCase):
         )
         print(system_prompt)
         await client.cleanup()
+
+    async def test_get_iteration_prompt_content_can_disable_countdown(self):
+        self.assertIsNone(
+            get_iteration_prompt_content(
+                iter_num=1,
+                max_iterations=5,
+                scheduler_mode=None,
+                append_iteration_user_message=False,
+            )
+        )
+        self.assertEqual(
+            get_iteration_prompt_content(
+                iter_num=4,
+                max_iterations=5,
+                scheduler_mode=None,
+                append_iteration_user_message=False,
+            ),
+            SUMMARIZE_PROMPT,
+        )
 
 
 if __name__ == "__main__":

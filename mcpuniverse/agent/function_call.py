@@ -88,6 +88,7 @@ class FunctionCallConfig(BaseAgentConfig):
     max_iterations: int = 5
     summarize_tool_response: bool = False
     use_custom_tools: bool = False
+    append_iteration_user_message: bool = True
 
 
 class FunctionCall(BaseAgent):
@@ -470,7 +471,7 @@ class FunctionCall(BaseAgent):
 
         for iter_num in range(self._config.max_iterations):
             # Add step counter only if not the first iteration to avoid cluttering
-            if iter_num > 0:
+            if self._config.append_iteration_user_message and iter_num > 0:
                 messages.append({
                     "role": "user",
                     "content": (

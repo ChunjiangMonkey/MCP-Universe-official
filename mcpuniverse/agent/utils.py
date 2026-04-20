@@ -46,6 +46,7 @@ def get_iteration_prompt_content(
     iter_num: int,
     max_iterations: int,
     scheduler_mode: Optional[Dict],
+    append_iteration_user_message: bool = True,
 ) -> Optional[str]:
     """
     Return the user prompt for this iteration: summarize on last step,
@@ -59,6 +60,8 @@ def get_iteration_prompt_content(
     result: Optional[str] = None
     if is_last_iter:
         result = SUMMARIZE_PROMPT
+    elif not append_iteration_user_message:
+        result = None
     elif scheduler_mode:
         if "dynamic" in scheduler_mode:
             dynamic_prompt = scheduler_mode["dynamic"]

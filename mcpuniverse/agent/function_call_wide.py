@@ -45,6 +45,7 @@ class FunctionCallConfig(BaseAgentConfig):
     max_iterations: int = 5
     summarize_tool_response: bool = False
     scheduler_mode: Optional[dict] = None
+    append_iteration_user_message: bool = True
 
 
 class FunctionCallWideResearch(BaseAgent):
@@ -430,6 +431,7 @@ class FunctionCallWideResearch(BaseAgent):
                 iter_num,
                 self._config.max_iterations,
                 self._config.scheduler_mode,
+                self._config.append_iteration_user_message,
             )
             if prompt_content is not None:
                 messages.append({"role": "user", "content": prompt_content})
